@@ -1,0 +1,7 @@
+node_modules/
+dist/
+bb-plugin-template/
+.env
+.env.*
+*.log
+*.tgz
