@@ -18,7 +18,8 @@
     "PLUGIN_OVERVIEW.md",
     "SECURITY.md",
     "docs",
-    "assets"
+    "assets",
+    "skills"
   ],
   "engines": {
     "bb": ">=0.48",
@@ -33,7 +34,9 @@
     },
     "server": "./server.ts",
     "host": "./host.ts",
-    "skills": []
+    "skills": [
+      "skills"
+    ]
   },
   "scripts": {
     "build": "bb plugin build",

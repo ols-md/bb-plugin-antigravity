@@ -58,7 +58,7 @@ export default async function antigravity(bb: BbPluginApi) {
       supportsThreadArchive: false,
       supportsThreadRename: false,
       permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["medium"],
+      reasoningLevels: ["low", "medium", "high"],
     },
     composerActions: [],
     models: { fallback: [], scope: "workspace" },
