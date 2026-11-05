@@ -9,6 +9,7 @@
     "host.ts",
     "prompt-mode.ts",
     "mode-controls.ts",
+    "usage.ts",
     "dist/*.js",
     "dist/*.css",
     "dist/*.meta.json",

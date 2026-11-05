@@ -24,6 +24,7 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 - **Plan and Build:** plan a task, then switch back to implementation.
 - **Permission controls:** choose Accept edits or Full access.
 - **Native skills:** discover your workspace and personal Antigravity skills in BB.
+- **Usage & quota limits:** view per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's sidebar and usage settings.
 - **CLI sandbox setting:** request the CLI terminal sandbox for new threads.
 - **A settings toggle:** show or hide the provider without editing configuration files.
 
@@ -34,6 +35,12 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 </p>
 
 Choose a model and reasoning level from BB's conversation picker. Available models and options depend on your CLI version and account.
+
+<p align="center">
+  <img src="assets/screenshots/usage.png" width="380" alt="Antigravity CLI quota and usage windows in BB's sidebar usage panel">
+</p>
+
+Check your remaining quota per model group (`Gemini 7d`, `Gemini 5h`, `Claude/GPT 7d`, `Claude/GPT 5h`, `Argon 7d`) and reset countdowns in BB's sidebar usage popover or **Settings -> Usage limits**.
 
 ## Getting started
 
@@ -122,7 +129,7 @@ The plugin stores these two boolean preferences. BB and the CLI can retain their
 
 See the [capability comparison](docs/FEATURES.md) for verified features and remaining gaps.
 
-Usage accounting, automatic CLI installation, conversation forking, manual compaction, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
+Automatic CLI installation, conversation forking, manual compaction, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
 
 ## Troubleshooting
 

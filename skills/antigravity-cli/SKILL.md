@@ -1,6 +1,6 @@
 ---
 name: antigravity-cli
-description: Spawn, configure, or troubleshoot Antigravity CLI (antigravity-cli) threads in BB — models, reasoning levels (low, medium, high), Build/Plan work modes, permissions, and sign-in.
+description: Spawn, configure, or troubleshoot Antigravity CLI (antigravity-cli) threads in BB — models, reasoning levels (low, medium, high), quota/usage windows, Build/Plan work modes, permissions, and sign-in.
 ---
 
 # Antigravity CLI provider
@@ -49,7 +49,17 @@ Work mode and permissions are separate controls:
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.
   - `sandbox` (default `false`): pass `--sandbox` when starting new threads (when `false`, inherits CLI settings).
 
+## Usage and quota limits
+
+`antigravity-cli` reports per-model-group quota windows (`Gemini 7d`, `Gemini 5h`, `Claude/GPT 7d`, `Claude/GPT 5h`, `Argon 7d`) by running `agy -p "/usage" --output-format json` and exposing both `provider/usage` and BB's discoverable `provider-usage.v1` RPC source.
+
+- Inspect live quota from the CLI or BB:
+
+```sh
+bb settings usage --refresh --json
+```
+
 ## Limits
 
-- Session fork/rewind (`fork: "none"`), manual `/compact`, service tiers, usage window reporting, and native thread archive/rename are not supported.
+- Session fork/rewind (`fork: "none"`), manual `/compact`, service tiers, and native thread archive/rename are not supported.
 - Native skills are indexed from workspace `.agents/skills` and `.agent/skills`, and from user `~/.gemini/antigravity-cli/skills`, `~/.gemini/skills`, and `~/.gemini/config/skills`.
