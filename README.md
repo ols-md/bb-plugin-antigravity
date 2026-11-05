@@ -77,7 +77,7 @@ Select **Antigravity CLI** in BB's provider picker, choose a model, and send a p
 Your BB thread -> Plugin -> BB's shared ACP bridge -> agy acp -> Antigravity service
 ```
 
-The plugin starts `agy acp --disable-telemetry` on the agent host. BB's shared [Agent Client Protocol (ACP)](https://agentclientprotocol.com) bridge handles streamed messages, tool updates, approval requests, and session communication. A small adapter maps BB's Plan action to the CLI's native mode.
+The plugin starts `agy acp --disable-telemetry` on the agent host. BB's shared [Agent Client Protocol (ACP)](https://agentclientprotocol.com) bridge handles streamed messages, tool updates, approval requests, and session communication. A small adapter exposes the CLI's work mode as Build or Plan in BB.
 
 Authentication stays with the CLI. You do not enter an API key into the plugin or maintain custom-agent JSON.
 
@@ -88,11 +88,11 @@ Planning and permissions are separate controls:
 | Control | Choice | Behavior |
 | --- | --- | --- |
 | Work mode | Plan | Selects the CLI's native Plan mode. Use it to research and outline a task. |
-| Work mode | Build | Turn off BB's Plan action to return to the CLI's Accept edits mode. |
+| Work mode | Build | Implement the task using native Accept edits behavior and the selected BB permission policy. |
 | Permissions | Accept edits | Uses native Accept edits behavior; remaining ACP approval requests are presented in BB. |
 | Permissions | Full access | BB's shared bridge automatically approves ACP permission requests. |
 
-Use BB's Plan action (or `/plan`) to enter planning. This mapping takes precedence over the CLI's native Mode selector, including any previously selected native mode. BB's Auto permission mode is unsupported by the shared ACP bridge.
+Choose **Build** or **Plan** in the **Mode** selector. Build is the default. The CLI's combined Default / Accept edits / Plan selector is replaced by these two work modes, so editing permissions are no longer repeated there. The separate Plan action is removed. BB's Auto permission mode is unsupported by the shared ACP bridge.
 
 ### Terminal sandbox
 

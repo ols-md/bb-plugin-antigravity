@@ -6,7 +6,7 @@ export function mapPromptMode(line: string): string {
   const options = request.params.options;
   options.sessionOptions = {
     ...options.sessionOptions,
-    mode: options.promptMode === "plan" ? "plan" : "accept-edits",
+    mode: options.sessionOptions?.mode === "plan" || (options.sessionOptions?.mode !== "accept-edits" && options.promptMode === "plan") ? "plan" : "accept-edits",
   };
   return JSON.stringify(request);
 }
