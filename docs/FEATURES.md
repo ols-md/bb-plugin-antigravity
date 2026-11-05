@@ -14,7 +14,7 @@ Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.104 on Windows. A terminal
 | Existing session load | Native session/load verified; full BB restart recovery not tested |
 | Session fork/rewind | Disabled: CLI initialize does not advertise session/fork |
 | Manual compaction | Disabled: sending /compact returned conversational text; actual compaction not established |
-| Subscription quota/usage | Disabled: generic ACP bridge has no Antigravity usage reader |
+| Subscription quota/usage | Supported via `agy -p "/usage" --output-format json` and `provider-usage.v1` |
 | Native archive/rename | Disabled: bridge does not implement these operations |
 | BB Auto permission profile | Unsupported by the shared ACP bridge |
 | Native plugin-provided skills | Not resolved into BB's picker yet |

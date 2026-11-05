@@ -2,7 +2,7 @@
 
 Use your Antigravity CLI sign-in to work inside BB. Choose models discovered from the CLI, read streamed replies, and review tool approval requests in your thread. Choose Build or Plan in the Mode selector, and show or hide the provider in the plugin settings.
 
-BB can list native personal and workspace Antigravity skills. A separate setting requests the CLI terminal sandbox for new threads; off inherits CLI settings.
+BB can list native personal and workspace Antigravity skills and display per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's usage sidebar and settings. A separate setting requests the CLI terminal sandbox for new threads; off inherits CLI settings.
 
 ## Permissions and sandbox
 
@@ -14,4 +14,4 @@ The plugin inherits the CLI's sandbox configuration. Sandbox availability depend
 
 Requires BB 0.48+, Node.js 22+, a separately installed Antigravity CLI with `agy acp` on the agent host's PATH, and an eligible signed-in account. Provider quota or charges apply. The desktop application alone is insufficient; remote hosts need their own CLI installation and sign-in.
 
-Windows has been tested locally; macOS and Linux need validation. Usage accounting, automatic CLI installation, forks, and manual compaction are not supported.
+Windows has been tested locally; macOS and Linux need validation. Automatic CLI installation, forks, and manual compaction are not supported.

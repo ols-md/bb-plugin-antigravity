@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { registerAntigravityUsageSource } from "./usage.ts";
 
 const launchSpec = {
   displayName: "Antigravity CLI",
@@ -8,6 +9,7 @@ const launchSpec = {
 };
 
 export default async function antigravity(bb: BbPluginApi) {
+  registerAntigravityUsageSource(bb);
   const settings = bb.settings.define({
     sandbox: {
       type: "boolean",
@@ -49,7 +51,7 @@ export default async function antigravity(bb: BbPluginApi) {
       project: [".agents/skills", ".agent/skills"],
     },
     experimental_visibility: "always",
-    maintenance: { health: true, usage: false, installation: false },
+    maintenance: { health: true, usage: true, installation: false },
     capabilities: {
       supportsServiceTier: false,
       supportsNativeUserQuestion: false,
