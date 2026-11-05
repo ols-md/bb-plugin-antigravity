@@ -41,7 +41,7 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.6.104"
+    "@get-bb/plugin-sdk": "0.6.109"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
