@@ -12,6 +12,7 @@ test('registers a native ACP provider without changing credentials or bypassing 
   assert.equal(declarations.length, 1);
   const provider = declarations[0];
   assert.equal(provider.id, 'antigravity-cli');
+  assert.equal(provider.icon, './assets/provider.svg');
   const spec = experimental_acpLaunchSpecSchema.parse(provider.experimental_bridgeOptions.acpLaunchSpec);
   assert.equal(spec.command, 'agy');
   assert.deepEqual(spec.args, ['acp', '--disable-telemetry']);
@@ -20,4 +21,24 @@ test('registers a native ACP provider without changing credentials or bypassing 
   assert.equal(spec.permissionCli, undefined);
   assert.deepEqual(provider.capabilities.permissionModes, ['accept-edits', 'full']);
   assert.equal(provider.experimental_bridgeOptions.acpDialect, 'acp');
+});
+
+
+test('sandbox is opt-in and only changes fixed CLI arguments', async () => {
+  let provider;
+  await plugin({
+    settings: { define() { return { get: async () => ({ enabled: true }), onChange() {} }; } },
+    providers: { register(value) { provider = value; return { dispose() {} }; } },
+  });
+  for (const sandbox of [undefined, false, true, 'true']) {
+    const options = provider.deriveProviderOptions({ settings: { sandbox } });
+    const spec = experimental_acpLaunchSpecSchema.parse(options.acpLaunchSpec);
+    assert.deepEqual(spec.args, ['acp', '--disable-telemetry', ...(sandbox === true ? ['--sandbox'] : [])]);
+    assert.equal(spec.command, 'agy');
+    assert.deepEqual(spec.env, {});
+  }
+  assert.ok(provider.experimental_nativeSkillRoots.user.includes('.gemini/antigravity-cli/skills'));
+  assert.ok(provider.experimental_nativeSkillRoots.project.includes('.agents/skills'));
+  assert.equal(provider.capabilities.fork, 'none');
+  assert.equal(provider.capabilities.supportsManualCompaction, false);
 });

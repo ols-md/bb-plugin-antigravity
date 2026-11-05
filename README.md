@@ -23,6 +23,8 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 - **Live model discovery:** models and reasoning options come from your CLI and account.
 - **Plan and Build:** plan a task, then switch back to implementation.
 - **Permission controls:** choose Accept edits or Full access.
+- **Native skills:** discover your workspace and personal Antigravity skills in BB.
+- **CLI sandbox setting:** request the CLI terminal sandbox for new threads.
 - **A settings toggle:** show or hide the provider without editing configuration files.
 
 ## Getting started
@@ -104,9 +106,13 @@ Plan is agent behavior, not enforced read-only access. Permission approvals and 
 
 Open **Settings -> Installed plugins -> Antigravity CLI** and use **Enable Antigravity CLI** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
 
-The plugin stores only this enable/disable preference. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
+The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. Off means inherit CLI settings, not force sandboxing off. Availability depends on the host OS.
+
+The plugin stores these two boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
 ## Limitations
+
+See the [capability comparison](docs/FEATURES.md) for verified features and remaining gaps.
 
 Usage accounting, automatic CLI installation, conversation forking, manual compaction, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
 
@@ -148,3 +154,9 @@ See [review notes](docs/REVIEW.md) and the [release checklist](docs/RELEASE.md) 
 [MIT](LICENSE). This project is independent of Google and BB. Their products, services, and dependencies retain their own terms.
 
 The plugin and provider ID is `antigravity-cli`. This is a separate community integration from the marketplace plugin named `antigravity`. Local installations using the earlier ID need to be reinstalled; existing threads retain their original provider ID.
+
+## Native skills
+
+BB discovers skills in workspace `.agents/skills` and legacy `.agent/skills`, and in personal `~/.gemini/antigravity-cli/skills`, `~/.gemini/skills`, and `~/.gemini/config/skills`. Installed CLI plugin skill directories are not yet resolved into BB's picker. See [Antigravity skills](https://antigravity.google/docs/skills).
+
+The provider uses the Antigravity mark in BB's model selector, rendered in one color to follow the theme. The plugin page uses the color mark. See [asset attribution](assets/README.md).
