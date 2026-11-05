@@ -6,7 +6,7 @@ The steps below follow the [Community marketplace contribution instructions](htt
 
 ## 1. Prepare a public release
 
-Choose the public author name and GitHub account that will own the listing. The current Git remote is `https://github.com/ols-md/bb-plugin-antigravity.git`; verify that it is public and contains the intended release before submitting. Add public repository metadata to `package.json` and replace all placeholders in [marketplace-entry.template.json](marketplace-entry.template.json). Do not put an email address in the author field.
+Choose the public author name and GitHub account that will own the listing. The current Git remote is `https://github.com/ols-md/bb-plugin-antigravity.git`; verify that it is public and contains the intended release before submitting. Add public repository metadata to `package.json` and use the prepared listing in [marketplace-entry.template.json](marketplace-entry.template.json). Do not put an email address in the author field.
 
 Review the exact files and Git history to publish. Build and validate the release:
 
@@ -23,7 +23,7 @@ The optional `npm run smoke -- --prompt` sends a real prompt and can consume quo
 
 Publish the reviewed commit and an immutable `v0.1.0` tag when ready. No npm publication is required for a Git-source listing. Do not move a released tag; use a new version for fixes.
 
-The template pins `ref: "v0.1.0"`. To let BB discover compatible updates from future release tags without changing the listing, replace `ref` with `range: "^0.1.0"`. Do not use both fields.
+The prepared listing uses `range: "^0.1.0"` so BB can discover compatible updates from future release tags. Do not combine `ref` and `range`.
 
 ## 2. Prepare the marketplace pull request
 
@@ -31,16 +31,16 @@ Fork [get-bb/marketplace](https://github.com/get-bb/marketplace) and create a co
 
 | Plugin checkout | Marketplace fork |
 | --- | --- |
-| Filled `docs/marketplace-entry.template.json` | `entries/antigravity.json` |
-| `assets/icon.svg` | `icons/antigravity.svg` |
-| `PLUGIN_OVERVIEW.md` | `overview/antigravity.md` |
-| Real BB screenshots, if useful | `screenshots/antigravity/` |
+| Filled `docs/marketplace-entry.template.json` | `entries/antigravity-cli.json` |
+| `assets/icon.svg` | `icons/antigravity-cli-<hash>.svg` |
+| `PLUGIN_OVERVIEW.md` | `overview/antigravity-cli.md` |
+| Real BB screenshots, if useful | `screenshots/antigravity-cli/` |
 
 Keep the filename equal to the entry ID. Check `reserved-plugin-ids.json` and existing entries for collisions. `agents-and-providers` is the current category for this plugin. Set `author.github` to the account responsible for later listing changes.
 
 Use the current [v2 entry schema](https://github.com/get-bb/marketplace/blob/main/schema/marketplace-v2.schema.json). Do not edit the generated marketplace documents.
 
-Screenshots may use PNG, JPEG, or WebP, at least 1200 pixels wide and no larger than 2 MiB each, with at most six images. Use a non-private test workspace and omit personal or account data. Reference them with `./screenshots/antigravity/<filename>` in the entry. Icons may be SVG, PNG, or WebP and must be 256 KB or less.
+Screenshots may use PNG, JPEG, or WebP, at least 1200 pixels wide and no larger than 2 MiB each, with at most six images. Use a non-private test workspace and omit personal or account data. Reference them with `./screenshots/antigravity-cli/<filename>` in the entry. Icons may be SVG, PNG, or WebP and must be 256 KB or less.
 
 The overview must be UTF-8, at most 4000 characters, and use supported Markdown with absolute HTTPS links. Raw HTML, images, tables, footnotes, and task lists are rejected in marketplace overviews; those restrictions do not apply to the repository README.
 

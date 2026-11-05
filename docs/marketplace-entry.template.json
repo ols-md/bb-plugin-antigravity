@@ -1,11 +1,25 @@
 {
-  "id": "antigravity",
-  "displayName": "Antigravity [Experimental]",
-  "description": "Chat with Antigravity inside BB using your existing CLI sign-in. Choose models and modes reported by the CLI and review tool approvals in your thread. Requires a separately installed Antigravity CLI and an eligible account; provider quota or charges apply.",
-  "icon": { "url": "./icons/antigravity.svg" },
-  "tags": ["acp", "agents", "antigravity"],
+  "id": "antigravity-cli",
+  "displayName": "Antigravity CLI [Experimental]",
+  "description": "Code with your Antigravity account inside BB. Choose CLI-discovered models, switch between Plan and Build, and review tool requests in your thread. Requires a separately installed Antigravity CLI and an eligible account; service quota or charges apply. Tested locally on Windows.",
+  "icon": {
+    "url": "./icons/antigravity-cli-b61622a0.svg"
+  },
+  "tags": [
+    "acp",
+    "cli",
+    "planning"
+  ],
   "category": "agents-and-providers",
-  "author": { "name": "REPLACE_WITH_PUBLIC_AUTHOR", "github": "REPLACE-WITH-GITHUB" },
-  "source": { "git": { "url": "https://github.com/REPLACE_WITH_OWNER/bb-plugin-antigravity.git", "ref": "v0.1.0" } },
-  "overview": "./overview/antigravity.md"
+  "author": {
+    "name": "dionis-d",
+    "github": "dionis-d"
+  },
+  "source": {
+    "git": {
+      "url": "https://github.com/ols-md/bb-plugin-antigravity.git",
+      "range": "^0.1.0"
+    }
+  },
+  "overview": "./overview/antigravity-cli.md"
 }

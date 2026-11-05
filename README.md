@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="72" height="72" alt="Antigravity plugin icon">
 </p>
 
-<h1 align="center">Antigravity for BB</h1>
+<h1 align="center">Antigravity CLI for BB</h1>
 
 <p align="center">Use your Antigravity CLI account to code in BB.</p>
 
@@ -19,7 +19,7 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 
 ## What you get
 
-- **One provider in BB:** select Antigravity when creating a thread.
+- **One provider in BB:** select Antigravity CLI when creating a thread.
 - **Live model discovery:** models and reasoning options come from your CLI and account.
 - **Plan and Build:** plan a task, then switch back to implementation.
 - **Permission controls:** choose Accept edits or Full access.
@@ -67,7 +67,7 @@ That URL tracks the default branch. Release and marketplace preparation are docu
 
 ### 3. Start a thread
 
-Select **Antigravity** in BB's provider picker, choose a model, and send a prompt. The CLI supplies the available models; availability depends on your account and installed version.
+Select **Antigravity CLI** in BB's provider picker, choose a model, and send a prompt. The CLI supplies the available models; availability depends on your account and installed version.
 
 ## How it works
 
@@ -102,7 +102,7 @@ Plan is agent behavior, not enforced read-only access. Permission approvals and 
 
 ## Settings
 
-Open **Settings -> Installed plugins -> Antigravity** and use **Enable Antigravity** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
+Open **Settings -> Installed plugins -> Antigravity CLI** and use **Enable Antigravity CLI** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
 
 The plugin stores only this enable/disable preference. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
@@ -114,7 +114,7 @@ Usage accounting, automatic CLI installation, conversation forking, manual compa
 
 | Problem | What to check |
 | --- | --- |
-| Antigravity is missing | Enable the installed plugin and its **Enable Antigravity** setting. |
+| Antigravity is missing | Enable the installed plugin and its **Enable Antigravity CLI** setting. |
 | `agy` cannot be found | Install the CLI on the agent host, check `PATH`, and restart BB. |
 | Sign-in is required or expired | Run `agy acp --login` on the agent host, then retry. |
 | ACP is unavailable | Update the CLI and confirm `agy acp --help` works. |
@@ -146,3 +146,5 @@ See [review notes](docs/REVIEW.md) and the [release checklist](docs/RELEASE.md) 
 ## License
 
 [MIT](LICENSE). This project is independent of Google and BB. Their products, services, and dependencies retain their own terms.
+
+The plugin and provider ID is `antigravity-cli`. This is a separate community integration from the marketplace plugin named `antigravity`. Local installations using the earlier ID need to be reinstalled; existing threads retain their original provider ID.

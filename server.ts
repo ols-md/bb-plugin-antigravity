@@ -4,14 +4,14 @@ export default async function antigravity(bb: BbPluginApi) {
   const settings = bb.settings.define({
     enabled: {
       type: "boolean",
-      label: "Enable Antigravity",
+      label: "Enable Antigravity CLI",
       description: "Show Antigravity in the provider picker. Existing running turns are not stopped.",
       default: true,
     },
   });
   const register = () => bb.providers.register({
-    id: "antigravity",
-    displayName: "Antigravity",
+    id: "antigravity-cli",
+    displayName: "Antigravity CLI",
     icon: "Orbit",
     family: "antigravity",
     strings: {
@@ -21,7 +21,7 @@ export default async function antigravity(bb: BbPluginApi) {
     },
     experimental_bridgeOptions: {
       acpLaunchSpec: {
-        displayName: "Antigravity",
+        displayName: "Antigravity CLI",
         command: "agy",
         args: ["acp", "--disable-telemetry"],
         env: {},
