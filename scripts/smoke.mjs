@@ -13,7 +13,10 @@ let response = '';
 child.stderr.resume(); // Do not copy vendor diagnostics or account details into public output.
 const lines = createInterface({ input: child.stdout });
 lines.on('line', line => {
-  const message = JSON.parse(line);
+  line = line.trim();
+  if (!line.startsWith('{')) return;
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
   if (message.method === 'session/update') {
     const update = message.params?.update;
     if (update?.sessionUpdate === 'agent_message_chunk') response += update.content?.text ?? '';
@@ -38,7 +41,7 @@ const timeout = setTimeout(() => { child.kill(); process.exitCode = 1; }, 60000)
 child.on('error', () => { for (const p of pending.values()) p.reject(new Error('Could not launch agy')); });
 child.on('exit', () => { for (const p of pending.values()) p.reject(new Error('ACP exited before completing')); });
 try {
-  const initialized = await request('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'bb-antigravity-smoke', version: '0.1.0' } });
+  const initialized = await request('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'bb-antigravity-smoke', version: '0.1.1' } });
   assert.equal(initialized.protocolVersion, 1);
   if (process.argv.includes('--capabilities')) console.log(JSON.stringify(initialized.agentCapabilities, null, 2));
   const session = await request('session/new', { cwd, mcpServers: [] });

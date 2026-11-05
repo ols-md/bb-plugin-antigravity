@@ -196,6 +196,43 @@ test('handles missing executable, unauthenticated, expired, and malformed usage 
   assert.equal(malformed.usage.status, 'error');
 });
 
+test('recognizes authentication failures in usage output', () => {
+  assert.equal(normalizeAntigravityUsageOutput('Not signed in').usage.status, 'unauthenticated');
+  assert.equal(normalizeAntigravityUsageOutput(JSON.stringify({ status: 'ERROR', error: 'token expired' })).usage.status, 'expired');
+});
+
+test('returns error when command resolution throws', async () => {
+  const result = await readAntigravityProviderUsage({
+    resolveCommand: () => { throw new Error('resolution failed'); },
+  });
+  assert.equal(result.usage.status, 'error');
+});
+
+test('responds to provider/usage JSON-RPC requests', async () => {
+  const originalWrite = process.stdout.write;
+  try {
+    experimental_providerBridge.start();
+    const response = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('No usage response')), 5000);
+      process.stdout.write = chunk => {
+        clearTimeout(timer);
+        resolve(String(chunk));
+        return true;
+      };
+      experimental_providerBridge.handleLine(JSON.stringify({
+        jsonrpc: '2.0', id: 42, method: 'provider/usage',
+        params: { providerOptions: { acpLaunchSpec: { displayName: 'Missing', command: 'missing-antigravity-test-command', args: [], env: {} } } },
+      }));
+    });
+    const parsed = JSON.parse(await response);
+    assert.equal(parsed.jsonrpc, '2.0');
+    assert.equal(parsed.id, 42);
+    assert.deepEqual(providerUsageResultSchema.parse(parsed.result), { supported: true, usage: { status: 'not_installed' } });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+});
+
 test('registers discoverable provider-usage.v1 RPC handlers and returns host usage', async () => {
   let registeredContract;
   let registeredHandlers;
@@ -248,4 +285,31 @@ test('registers discoverable provider-usage.v1 RPC handlers and returns host usa
   assert.equal(getResult.usage.status, 'ok');
   assert.equal(getResult.usage.windows.length, 5);
   assert.equal(getResult.usage.windows[0].label, 'Gemini 7d');
+});
+
+test('evicts cached usage when the provider is removed', async () => {
+  let handlers;
+  let enabled = true;
+  let collections = 0;
+  const bb = {
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: { get: async () => ({ id: 'host_1', name: 'Machine', status: 'connected' }) },
+      providers: { list: async () => enabled ? [{ id: 'antigravity-cli', pluginId: 'antigravity-cli' }] : [] },
+      system: { usageLimits: async () => {
+        collections++;
+        return { 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage };
+      } },
+    },
+  };
+  registerAntigravityUsageSource(bb);
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const resourceId = JSON.stringify(['host_1', 'antigravity-cli']);
+  assert.equal((await getResource({ resourceId, refresh: true })).usage.status, 'ok');
+  enabled = false;
+  await assert.rejects(getResource({ resourceId, refresh: true }), /no longer exists/);
+  enabled = true;
+  await getResource({ resourceId, refresh: false });
+  assert.equal(collections, 2);
 });

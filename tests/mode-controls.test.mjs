@@ -38,6 +38,16 @@ test('transport handles split lines, UTF-8, and unrelated messages', async () =>
   assert.deepEqual(lines.slice(1), ['null', 'invalid']);
 });
 
+test('transport transforms a trailing line without a newline', async () => {
+  const output = modeControlOutput();
+  const chunks = [];
+  output.on('data', chunk => chunks.push(chunk));
+  output.end(JSON.stringify({result: {models: [{sessionOptions: [mode]}]}}));
+  await new Promise(resolve => output.on('end', resolve));
+  const result = JSON.parse(Buffer.concat(chunks).toString());
+  assert.deepEqual(result.result.models[0].sessionOptions[0].values.map(v => v.label), ['Build', 'Plan']);
+});
+
 test('Build exits a previous BB plan action', () => {
   const options = JSON.parse(mapPromptMode(JSON.stringify({method: 'turn/start', params: {options: {promptMode: 'plan', sessionOptions: {mode: 'accept-edits'}}}}))).params.options;
   assert.equal(options.sessionOptions.mode, 'accept-edits');
