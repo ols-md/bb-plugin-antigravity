@@ -146,7 +146,7 @@ When reporting an issue, include BB/CLI versions and a short reproduction. Remov
 
 ## Development
 
-The test runner requires Node.js 22.18+ or Node.js 24. The SDK dependency is pinned to 0.6.104.
+The test runner requires Node.js 22.18+ or Node.js 24. The SDK dependency is pinned to 0.6.109.
 
 ```sh
 npm ci --ignore-scripts

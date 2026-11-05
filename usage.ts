@@ -95,10 +95,13 @@ export function formatBucketWindowLabel(groupName: string | null, bucket: AgyBuc
 }
 
 export function normalizeAntigravityUsageOutput(stdout: string): ProviderUsageResult {
+  const trimmed = stdout.trim();
   let raw: unknown;
   try {
-    raw = JSON.parse(stdout.trim());
+    raw = JSON.parse(trimmed);
   } catch {
+    if (isUnauthenticatedFailure(trimmed)) return { supported: true, usage: { status: "unauthenticated" } };
+    if (isExpiredFailure(trimmed)) return { supported: true, usage: { status: "expired" } };
     return {
       supported: true,
       usage: {
@@ -112,10 +115,8 @@ export function normalizeAntigravityUsageOutput(stdout: string): ProviderUsageRe
 
   const parsed = agyUsageCommandSchema.safeParse(raw);
   if (!parsed.success) {
-    const text = stdout.toLowerCase();
-    if (text.includes("not signed in") || text.includes("authentication required") || text.includes("unauthenticated")) {
-      return { supported: true, usage: { status: "unauthenticated" } };
-    }
+    if (isUnauthenticatedFailure(trimmed)) return { supported: true, usage: { status: "unauthenticated" } };
+    if (isExpiredFailure(trimmed)) return { supported: true, usage: { status: "expired" } };
     return {
       supported: true,
       usage: {
@@ -205,11 +206,10 @@ export async function readAntigravityProviderUsage(options?: {
   const resolveCommand = options?.resolveCommand ?? ((cmd, opts) => experimental_hostToolchain.resolve(cmd, opts));
   const execFile = options?.execFile ?? experimental_execHostFile;
 
-  if (!command || resolveCommand(command, { cwd, env }) === null) {
-    return { supported: true, usage: { status: "not_installed" } };
-  }
-
   try {
+    if (!command || await resolveCommand(command, { cwd, env }) === null) {
+      return { supported: true, usage: { status: "not_installed" } };
+    }
     const { stdout, stderr } = await execFile(
       command,
       ["-p", "/usage", "--output-format", "json"],
@@ -221,13 +221,15 @@ export async function readAntigravityProviderUsage(options?: {
       },
     );
     const combined = `${stdout}\n${stderr}`;
-    if (!stdout.trim() && isUnauthenticatedFailure(combined)) {
+    const normalized = normalizeAntigravityUsageOutput(stdout);
+    const usage = normalized.usage as { status: string };
+    if (usage.status === "error" && isUnauthenticatedFailure(combined)) {
       return { supported: true, usage: { status: "unauthenticated" } };
     }
-    if (!stdout.trim() && isExpiredFailure(combined)) {
+    if (usage.status === "error" && isExpiredFailure(combined)) {
       return { supported: true, usage: { status: "expired" } };
     }
-    return normalizeAntigravityUsageOutput(stdout);
+    return normalized;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return { supported: true, usage: { status: "not_installed" } };
@@ -254,13 +256,8 @@ export async function readAntigravityProviderUsage(options?: {
   }
 }
 
-const planSchema = z.object({
-  id: z.string().min(1),
-  multiplier: z.number().int().positive().nullable(),
-});
-
 const baseUsageFields = {
-  plan: planSchema.nullable().default(null),
+  plan: z.object({ id: z.string().min(1), multiplier: z.number().int().positive().nullable() }).nullable().default(null),
   accountEmail: z.string().nullable(),
   planLabel: z.string().nullable(),
 };
@@ -332,14 +329,6 @@ const providerUsageSourceContract = defineRpcContract({
 });
 
 const resourceIdTupleSchema = z.tuple([z.string().min(1), z.string().min(1)]);
-const extraUsageMetaSchema = z.object({
-  accountKey: z.string().min(1).nullable().catch(null),
-  plan: planSchema.nullable().catch(null),
-});
-const extraWindowMetaSchema = z.object({
-  kind: windowKindSchema.catch("custom"),
-  model: z.string().nullable().catch(null),
-});
 
 export function registerAntigravityUsageSource(bb: BbPluginApi) {
   if (!bb.rpc || !bb.sdk) return;
@@ -352,6 +341,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     const [hostId, providerId] = resourceIdTupleSchema.parse(JSON.parse(resourceId));
     const host = await bb.sdk.hosts.get({ hostId }).catch((error: unknown) => {
       if (error instanceof Error && "status" in error && error.status === 404) {
+        cache.delete(resourceId);
         throw new Error("Usage resource no longer exists.");
       }
       throw error;
@@ -375,6 +365,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
     const providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
     if (!providers.some(p => p.id === providerId && p.pluginId === (bb.pluginId ?? PLUGIN_ID) && p.id === PROVIDER_ID)) {
+      cache.delete(resourceId);
       throw new Error("Usage resource no longer exists.");
     }
 
@@ -393,21 +384,19 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       if (!rawUsage) {
         throw new Error("Provider returned no usage information.");
       }
-      const meta = extraUsageMetaSchema.parse(rawUsage);
       const rawRecord = rawUsage as Record<string, unknown>;
       const result = getResourceOutputSchema.parse({
-        accountKey: meta.accountKey,
+        accountKey: null,
         observedAt: rawUsage.status === "ok" ? Date.now() : previous?.observedAt ?? null,
         usage: {
           ...rawUsage,
           accountEmail: typeof rawRecord.accountEmail === "string" ? rawRecord.accountEmail : null,
           planLabel: typeof rawRecord.planLabel === "string" ? rawRecord.planLabel : null,
-          plan: meta.plan,
+          plan: null,
           ...(rawUsage.status === "ok"
             ? {
                 windows: rawUsage.windows.map((win, index) => ({
                   ...win,
-                  ...extraWindowMetaSchema.parse(win),
                   id: `${index}:${win.label}`,
                   cost: win.cost ?? null,
                 })),

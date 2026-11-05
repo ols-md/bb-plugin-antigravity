@@ -21,7 +21,7 @@ npm pack --dry-run
 
 The optional `npm run smoke -- --prompt` sends a real prompt and can consume quota. Also verify a clean Git-source installation, streaming, cancellation, approval allow/deny, editing, and resumed conversations in BB. Validate macOS/Linux before claiming support there.
 
-Publish the reviewed commit and an immutable `v0.1.0` tag when ready. No npm publication is required for a Git-source listing. Do not move a released tag; use a new version for fixes.
+Publish the reviewed commit and an immutable `v0.1.1` tag when ready. No npm publication is required for a Git-source listing. Do not move a released tag; use a new version for fixes.
 
 The prepared listing uses `range: "^0.1.0"` so BB can discover compatible updates from future release tags. Do not combine `ref` and `range`.
 

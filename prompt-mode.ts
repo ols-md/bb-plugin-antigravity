@@ -1,7 +1,9 @@
 // ACP combines planning and approval policy in a single native mode.
-export function mapPromptMode(line: string): string {
-  let request;
-  try { request = JSON.parse(line); } catch { return line; }
+export function mapPromptMode(line: string, parsedLine?: unknown): string {
+  let request: any = parsedLine;
+  if (arguments.length < 2) {
+    try { request = JSON.parse(line); } catch { return line; }
+  }
   if (request?.method !== "turn/start" || !request.params?.options) return line;
   const options = request.params.options;
   options.sessionOptions = {

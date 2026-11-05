@@ -1,6 +1,6 @@
 # Provider capabilities
 
-Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.104 on Windows. A terminal CLI feature does not imply that the same feature is exposed through ACP.
+Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.109 on Windows. A terminal CLI feature does not imply that the same feature is exposed through ACP.
 
 | Feature | Current integration |
 | --- | --- |
