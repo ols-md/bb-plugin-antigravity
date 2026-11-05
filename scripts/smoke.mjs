@@ -42,6 +42,15 @@ try {
   assert.equal(initialized.protocolVersion, 1);
   const session = await request('session/new', { cwd, mcpServers: [] });
   assert.ok(session.sessionId);
+  if (process.argv.includes('--modes')) {
+    const modes = session.modes?.availableModes ?? [];
+    assert.ok(modes.some(mode => mode.id === 'plan'));
+    assert.ok(modes.some(mode => mode.id === 'accept-edits'));
+    for (const modeId of ['plan', 'accept-edits']) {
+      await request('session/set_mode', { sessionId: session.sessionId, modeId });
+    }
+    console.log('Native Plan/Build mode transitions passed.');
+  }
   if (process.argv.includes('--prompt')) {
     const result = await request('session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: 'Reply with exactly ACP_OK. Do not use tools.' }] });
     assert.equal(result.stopReason, 'end_turn');

@@ -1,48 +1,50 @@
 {
-    "name":  "bb-plugin-antigravity",
-    "version":  "0.1.0",
-    "type":  "module",
-    "license":  "MIT",
-    "description":  "Use the installed Antigravity CLI as an ACP agent in BB.",
-    "files":  [
-                  "server.ts",
-                  "host.ts",
-                  "dist",
-                  "README.md",
-                  "LICENSE",
-                  "PLUGIN_OVERVIEW.md",
-                  "SECURITY.md",
-                  "docs",
-                  "assets"
-              ],
-    "engines":  {
-                    "bb":  "\u003e=0.48",
-                    "bbPluginSdk":  "\u003e=0.6.104 \u003c0.7",
-                    "node":  "\u003e=22"
-                },
-    "bb":  {
-               "name":  "Antigravity [Experimental]",
-               "description":  "Chat with Antigravity in BB using your installed CLI and existing sign-in.",
-               "branding":  {
-                                "icon":  "./assets/icon.svg"
-                            },
-               "server":  "./server.ts",
-               "host":  "./host.ts",
-               "skills":  [
-
-                          ]
-           },
-    "scripts":  {
-                    "build":  "bb plugin build",
-                    "check":  "tsc --noEmit",
-                    "test":  "node --experimental-strip-types --test tests/provider.test.mjs",
-                    "smoke":  "node scripts/smoke.mjs"
-                },
-    "dependencies":  {
-                         "@get-bb/plugin-sdk":  "0.6.104"
-                     },
-    "devDependencies":  {
-                            "typescript":  "^5.7.0",
-                            "@types/node":  "^22.0.0"
-                        }
+  "name": "bb-plugin-antigravity",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Use the installed Antigravity CLI as an ACP agent in BB.",
+  "files": [
+    "server.ts",
+    "host.ts",
+    "prompt-mode.ts",
+    "dist/*.js",
+    "dist/*.css",
+    "dist/*.meta.json",
+    "!dist/*.map",
+    "README.md",
+    "LICENSE",
+    "PLUGIN_OVERVIEW.md",
+    "SECURITY.md",
+    "docs",
+    "assets"
+  ],
+  "engines": {
+    "bb": ">=0.48",
+    "bbPluginSdk": ">=0.6.104 <0.7",
+    "node": ">=22"
+  },
+  "bb": {
+    "name": "Antigravity [Experimental]",
+    "description": "Chat with Antigravity in BB using your installed CLI and existing sign-in.",
+    "branding": {
+      "icon": "./assets/icon.svg"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "skills": []
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@get-bb/plugin-sdk": "0.6.104"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
 }

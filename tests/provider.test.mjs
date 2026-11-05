@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import plugin from '../server.ts';
 import { experimental_acpLaunchSpecSchema } from '@get-bb/plugin-sdk/provider-bridge/acp';
 
-test('registers a native ACP provider without changing credentials or bypassing approvals', () => {
+test('registers a native ACP provider without changing credentials or bypassing approvals', async () => {
   const declarations = [];
-  plugin({ providers: { register(value) { declarations.push(value); } } });
+  await plugin({
+    settings: { define() { return { get: async () => ({ enabled: true }), onChange() {} }; } },
+    providers: { register(value) { declarations.push(value); return { dispose() {} }; } },
+  });
   assert.equal(declarations.length, 1);
   const provider = declarations[0];
   const spec = experimental_acpLaunchSpecSchema.parse(provider.experimental_bridgeOptions.acpLaunchSpec);
@@ -14,6 +17,6 @@ test('registers a native ACP provider without changing credentials or bypassing 
   assert.deepEqual(spec.env, {});
   assert.equal(spec.cwd, undefined);
   assert.equal(spec.permissionCli, undefined);
-  assert.deepEqual(provider.capabilities.permissionModes, ['accept-edits']);
+  assert.deepEqual(provider.capabilities.permissionModes, ['accept-edits', 'full']);
   assert.equal(provider.experimental_bridgeOptions.acpDialect, 'acp');
 });

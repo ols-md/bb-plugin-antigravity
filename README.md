@@ -21,7 +21,7 @@ Once a public repository is published, BB can install it directly by repository 
 
 ## What works
 
-BB's shared ACP bridge handles streamed replies, tool updates, approval requests, conversation sessions, and the model/mode catalog advertised by the CLI. Models are discovered rather than hardcoded. Antigravity retains its permission checks; the plugin never adds `--dangerously-skip-permissions`. The CLI's advertised mode selector controls Default, Accept edits, and Plan behavior. BB's accept-edits permission profile does not promise a filesystem sandbox.
+BB's shared ACP bridge handles streamed replies, tool updates, approval requests, conversation sessions, and the model/mode catalog advertised by the CLI. Models are discovered rather than hardcoded. Antigravity retains its permission checks; the plugin never adds `--dangerously-skip-permissions`. Use BB's Plan action for planning and turn it off to return to Build (native Accept edits). This mapping takes precedence over the native Mode selector. Plan is CLI behavior, not a filesystem sandbox. The permission picker separately offers Accept edits and Full access; Full access automatically approves ACP permission requests. Auto is unsupported by the shared ACP bridge. BB's accept-edits permission profile does not promise a filesystem sandbox.
 
 Usage accounting, automatic CLI installation, conversation forking, and manual compaction are not advertised. CLI permissions and account availability remain subject to Antigravity itself.
 
@@ -47,3 +47,7 @@ npm run smoke
 `npm run smoke` opens a real ACP session without sending a prompt. `npm run smoke -- --prompt` sends a small request using your account and can consume quota. Tests use a temporary empty workspace and refuse tool requests. Windows was verified locally; macOS and Linux still need release checks.
 
 See [security and privacy](SECURITY.md) and [review results](docs/REVIEW.md). MIT licensed. This project is independent of Google and BB; their products, services, and dependencies retain their respective terms.
+
+## Settings
+
+Settings ? Installed plugins ? Antigravity includes **Enable Antigravity**. Changes update provider registration immediately; disabling does not stop a running turn. The standard installed-plugin switch can disable the entire plugin. Only this boolean is stored by the plugin; CLI sign-in remains managed by Antigravity.

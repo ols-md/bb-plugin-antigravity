@@ -1,7 +1,15 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
-export default function antigravity(bb: BbPluginApi) {
-  bb.providers.register({
+export default async function antigravity(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    enabled: {
+      type: "boolean",
+      label: "Enable Antigravity",
+      description: "Show Antigravity in the provider picker. Existing running turns are not stopped.",
+      default: true,
+    },
+  });
+  const register = () => bb.providers.register({
     id: "antigravity",
     displayName: "Antigravity",
     icon: "Orbit",
@@ -29,11 +37,16 @@ export default function antigravity(bb: BbPluginApi) {
       supportsManualCompaction: false,
       supportsThreadArchive: false,
       supportsThreadRename: false,
-      permissionModes: ["accept-edits"],
+      permissionModes: ["accept-edits", "full"],
       reasoningLevels: ["medium"],
     },
-    composerActions: [],
+    composerActions: ["plan"],
     models: { fallback: [], scope: "workspace" },
+  });
+  let registration = (await settings.get()).enabled ? register() : undefined;
+  settings.onChange(({ enabled }) => {
+    registration?.dispose();
+    registration = enabled ? register() : undefined;
   });
 }
 
