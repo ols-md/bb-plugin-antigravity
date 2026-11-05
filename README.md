@@ -27,6 +27,14 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 - **CLI sandbox setting:** request the CLI terminal sandbox for new threads.
 - **A settings toggle:** show or hide the provider without editing configuration files.
 
+## Preview
+
+<p align="center">
+  <img src="assets/screenshots/model-picker.png" width="281" alt="Antigravity model picker in BB, showing available models and Low, Medium, and High reasoning choices">
+</p>
+
+Choose a model and reasoning level from BB's conversation picker. Available models and options depend on your CLI version and account.
+
 ## Getting started
 
 ### 1. Prepare the agent host
