@@ -1,6 +1,6 @@
 # Publish to the BB Community marketplace
 
-The marketplace lists plugin metadata. The source code stays in a public Git repository or npm package. This plugin is not listed yet; `marketplace-entry.template.json` is a starting point, not a validated submission.
+The marketplace lists plugin metadata. The source code stays in a public Git repository or npm package. `antigravity-cli` is published in the [BB Community marketplace](https://github.com/get-bb/marketplace); `marketplace-entry.template.json` is the reference entry for marketplace updates.
 
 The steps below follow the [Community marketplace contribution instructions](https://github.com/get-bb/marketplace#submit-a-plugin). Recheck them before submitting because the marketplace contract can change independently of BB.
 
@@ -62,4 +62,4 @@ Marketplace CI and a maintainer review the source and behavior. Merging publishe
 
 ## Current release status
 
-Local build, tests, settings toggling, native mode transitions, and npm package inventory have been checked on Windows. Visual conversation testing, clean public Git installation, screenshots, public release verification, and marketplace validation remain release work. This documentation change does not publish a release or submit a marketplace PR.
+The [public GitHub repository](https://github.com/ols-md/bb-plugin-antigravity) and BB Community marketplace listing (`antigravity-cli`, tracking `^0.1.0`) are live and verified on Windows. macOS and Linux validation remains open.

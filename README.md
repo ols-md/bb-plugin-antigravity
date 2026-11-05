@@ -15,7 +15,7 @@
 
 An experimental community provider that connects [BB](https://getbb.app) to the [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli). Keep your existing CLI sign-in, choose available models, and work with streamed responses and tool approvals inside BB.
 
-**Status:** installed and tested locally on Windows. A Community marketplace listing is not published yet. macOS and Linux still need validation.
+**Status:** available in the BB Community marketplace and tested on Windows. macOS and Linux still need validation.
 
 ## What you get
 
@@ -65,22 +65,26 @@ The executable must be on that machine's `PATH`. Restart BB after changing `PATH
 
 ### 2. Install the plugin
 
-For now, install from a local checkout. Inside the plugin directory, run:
+Install from the BB Community marketplace:
+
+```sh
+bb plugin install antigravity-cli
+```
+
+Alternatively, install **Antigravity CLI** from **Settings -> Plugins** in BB, or install directly from the [GitHub repository](https://github.com/ols-md/bb-plugin-antigravity):
+
+```sh
+bb plugin install https://github.com/ols-md/bb-plugin-antigravity
+```
+
+To install from a local checkout, run inside the plugin directory:
 
 ```sh
 npm ci --ignore-scripts
 bb plugin install .
 ```
 
-Review and accept BB's installation prompt. Plugins run with full trust.
-
-Once a public release is available, users can install from the [GitHub repository](https://github.com/ols-md/bb-plugin-antigravity) directly:
-
-```sh
-bb plugin install https://github.com/ols-md/bb-plugin-antigravity
-```
-
-That URL tracks the default branch. Release and marketplace preparation are documented in [docs/RELEASE.md](docs/RELEASE.md).
+Review and accept BB's installation prompt. Plugins run with full trust. The GitHub URL tracks the default branch. Release and marketplace information is documented in [docs/RELEASE.md](docs/RELEASE.md).
 
 ### 3. Start a thread
 

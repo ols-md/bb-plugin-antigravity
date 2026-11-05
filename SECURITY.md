@@ -8,4 +8,4 @@ The plugin stores its enable and request-sandbox booleans in BB settings. Existi
 
 Antigravity's normal approval checks stay enabled in Accept edits mode. Selecting Full access explicitly makes BB's shared bridge approve ACP permission requests automatically. Plan mode is a native CLI behavior, not enforced read-only access. These checks are not an operating-system sandbox. Only open trusted workspaces and review tool approvals. Dependency and upstream bridge security remain part of this plugin's trust boundary.
 
-Do not post credentials or raw private session logs in public issues. Report a suspected issue privately to the repository maintainer through GitHub's private security reporting once a public repository has been configured.
+Do not post credentials or raw private session logs in public issues. Report a suspected issue privately to the repository maintainer through GitHub's private security reporting on [ols-md/bb-plugin-antigravity](https://github.com/ols-md/bb-plugin-antigravity).
