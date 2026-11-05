@@ -8,6 +8,7 @@
     "server.ts",
     "host.ts",
     "prompt-mode.ts",
+    "mode-controls.ts",
     "dist/*.js",
     "dist/*.css",
     "dist/*.meta.json",

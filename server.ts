@@ -60,7 +60,7 @@ export default async function antigravity(bb: BbPluginApi) {
       permissionModes: ["accept-edits", "full"],
       reasoningLevels: ["medium"],
     },
-    composerActions: ["plan"],
+    composerActions: [],
     models: { fallback: [], scope: "workspace" },
   });
   let registration = (await settings.get()).enabled ? register() : undefined;
