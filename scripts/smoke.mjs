@@ -40,6 +40,7 @@ child.on('exit', () => { for (const p of pending.values()) p.reject(new Error('A
 try {
   const initialized = await request('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'bb-antigravity-smoke', version: '0.1.0' } });
   assert.equal(initialized.protocolVersion, 1);
+  if (process.argv.includes('--capabilities')) console.log(JSON.stringify(initialized.agentCapabilities, null, 2));
   const session = await request('session/new', { cwd, mcpServers: [] });
   assert.ok(session.sessionId);
   if (process.argv.includes('--modes')) {
@@ -50,6 +51,12 @@ try {
       await request('session/set_mode', { sessionId: session.sessionId, modeId });
     }
     console.log('Native Plan/Build mode transitions passed.');
+  }
+  if (process.argv.includes('--features')) {
+    const second = await request('session/new', { cwd, mcpServers: [] });
+    assert.notEqual(session.sessionId, second.sessionId);
+    await request('session/load', { sessionId: session.sessionId, cwd, mcpServers: [] });
+    console.log('Independent sessions and session load passed.');
   }
   if (process.argv.includes('--prompt')) {
     const result = await request('session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: 'Reply with exactly ACP_OK. Do not use tools.' }] });
