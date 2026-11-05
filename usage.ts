@@ -52,20 +52,38 @@ function normalizeResetIso(resetTime: string | null | undefined): string | null 
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
+function collapseWhitespace(text: string): string {
+  return text.trim().split(/\s+/u).join(" ");
+}
+
+function stripTrailingToken(text: string, tokenLower: string): string {
+  const suffix = ` ${tokenLower}`;
+  if (text.toLowerCase().endsWith(suffix)) {
+    return text.slice(0, -suffix.length);
+  }
+  return text;
+}
+
 function shortenGroupName(groupName: string): string {
-  const trimmed = groupName.trim();
-  if (/^Gemini\s+Models$/iu.test(trimmed)) return "Gemini";
-  if (/^Claude\s+and\s+GPT\s+models$/iu.test(trimmed)) return "Claude/GPT";
-  if (/^Gemini\s+4\s+Argon$/iu.test(trimmed)) return "Argon";
-  return trimmed.replace(/\s+models$/iu, "");
+  const normalized = collapseWhitespace(groupName);
+  const lower = normalized.toLowerCase();
+  if (lower === "gemini models") return "Gemini";
+  if (lower === "claude and gpt models") return "Claude/GPT";
+  if (lower === "gemini 4 argon") return "Argon";
+  return stripTrailingToken(normalized, "models");
 }
 
 function formatWindowSuffix(bucket: AgyBucket): string {
   const win = bucket.window?.trim().toLowerCase();
-  if (win === "5h" || win === "five-hour" || /^five\s+hour/iu.test(bucket.name)) return "5h";
-  if (win === "weekly" || /weekly/iu.test(bucket.name)) return "7d";
-  if (win === "daily" || /daily/iu.test(bucket.name)) return "1d";
-  return win || bucket.name.replace(/\s*limit(?:\s+remaining)?$/iu, "").trim();
+  const normalizedName = collapseWhitespace(bucket.name);
+  const lowerName = normalizedName.toLowerCase();
+  if (win === "5h" || win === "five-hour" || lowerName.startsWith("five hour")) return "5h";
+  if (win === "weekly" || lowerName.includes("weekly")) return "7d";
+  if (win === "daily" || lowerName.includes("daily")) return "1d";
+  if (win) return win;
+  const withoutRemaining = stripTrailingToken(normalizedName, "remaining");
+  const withoutLimit = stripTrailingToken(withoutRemaining, "limit");
+  return withoutLimit.toLowerCase() === "limit" ? "" : withoutLimit;
 }
 
 export function formatBucketWindowLabel(groupName: string | null, bucket: AgyBucket): string {
