@@ -6,7 +6,7 @@ import { experimental_acpLaunchSpecSchema } from '@get-bb/plugin-sdk/provider-br
 test('registers a native ACP provider without changing credentials or bypassing approvals', async () => {
   const declarations = [];
   await plugin({
-    settings: { define() { return { get: async () => ({ enabled: true }), onChange() {} }; } },
+    settings: { define(descriptors) { assert.equal(descriptors.autoApprove.default, false); return { get: async () => ({ enabled: true }), onChange() {} }; } },
     providers: { register(value) { declarations.push(value); return { dispose() {} }; } },
   });
   assert.equal(declarations.length, 1);
@@ -39,6 +39,9 @@ test('sandbox is opt-in and only changes fixed CLI arguments', async () => {
     assert.deepEqual(spec.args, ['acp', '--disable-telemetry', ...(sandbox === true ? ['--sandbox'] : [])]);
     assert.equal(spec.command, 'agy');
     assert.deepEqual(spec.env, {});
+  }
+  for (const autoApprove of [undefined, false, true, 'true']) {
+    assert.equal(provider.deriveProviderOptions({ settings: { autoApprove } }).autoApprove, autoApprove === true);
   }
   assert.ok(provider.experimental_nativeSkillRoots.user.includes('.gemini/antigravity-cli/skills'));
   assert.ok(provider.experimental_nativeSkillRoots.project.includes('.agents/skills'));

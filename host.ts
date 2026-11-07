@@ -1,4 +1,5 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
+import { threadStartParamsSchema, threadResumeParamsSchema, turnStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";
 import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
@@ -24,11 +25,47 @@ function parseUsageRequest(parsed: unknown): { id: string | number; command: str
 }
 
 let stdoutFilterInstalled = false;
+const autoApproveThreads = new Map<string, boolean>();
+
+export function rememberApprovalSetting(request: any) {
+  const schema = request?.method === "thread/start" ? threadStartParamsSchema
+    : request?.method === "thread/resume" ? threadResumeParamsSchema
+    : request?.method === "turn/start" ? turnStartParamsSchema : null;
+  const parsed = schema?.safeParse(request.params);
+  if (parsed?.success) autoApproveThreads.set(parsed.data.threadId,
+    parsed.data.options.providerOptions?.autoApprove === true &&
+    parsed.data.options.permissionMode === "accept-edits" && parsed.data.options.permissionEscalation === "ask");
+}
+
+export function interceptApproval(line: string): boolean {
+  let message: any;
+  try { message = JSON.parse(line); } catch { return false; }
+  if (message?.jsonrpc !== "2.0" || message.method !== "interaction/request" ||
+      (typeof message.id !== "string" && typeof message.id !== "number") ||
+      !autoApproveThreads.get(message.params?.threadId)) return false;
+  const payload = message.params?.payload;
+  if (payload?.kind !== "approval" || typeof payload.subject?.itemId !== "string" ||
+      !["command", "file_change", "tool_use"].includes(payload.subject.kind) ||
+      !(payload.reason === null || typeof payload.reason === "string") ||
+      !Array.isArray(payload.availableDecisions) ||
+      !payload.availableDecisions.every((value: unknown) => ["allow_once", "allow_for_session", "deny"].includes(value as string))) return false;
+  const subject = payload.subject;
+  if (subject.kind === "command" && (typeof subject.command !== "string" || !Array.isArray(subject.actions) || !(subject.cwd === null || typeof subject.cwd === "string") || subject.sessionGrant !== null)) return false;
+  if (subject.kind === "file_change" && (!(subject.writeScope === null || typeof subject.writeScope === "string") || subject.sessionGrant !== null)) return false;
+  if (subject.kind === "tool_use" && (typeof subject.tool !== "string" || typeof subject.presentation?.icon?.glyph !== "string" || typeof subject.presentation?.label?.pending !== "string" || typeof subject.presentation?.label?.completed !== "string")) return false;
+  const decisions = payload.availableDecisions;
+  const decision = decisions.includes("allow_once") ? "allow_once" : decisions.includes("allow_for_session") ? "allow_for_session" : null;
+  if (!decision) return false;
+  queueMicrotask(() => experimental_acpProviderBridge.handleLine(JSON.stringify({
+    jsonrpc: "2.0", id: message.id, result: { decision, grantedPermissions: null },
+  })));
+  return true;
+}
 function ensureStdoutFilter() {
   if (stdoutFilterInstalled) return;
   stdoutFilterInstalled = true;
   const write = process.stdout.write.bind(process.stdout);
-  const output = modeControlOutput();
+  const output = modeControlOutput(interceptApproval);
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
     output.write(chunk, encodingOrCallback, callback)) as typeof process.stdout.write;
@@ -43,6 +80,7 @@ export const experimental_providerBridge = {
     ensureStdoutFilter();
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { parsed = null; }
+    rememberApprovalSetting(parsed);
     const usageRequest = parseUsageRequest(parsed);
     if (usageRequest !== null) {
       void readAntigravityProviderUsage({

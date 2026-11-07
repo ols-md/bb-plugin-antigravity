@@ -32,7 +32,7 @@ export function presentModeControls(line: string): string {
 }
 
 // The bridge has no output hook; adapt only this dedicated bridge process's JSONL transport.
-export function modeControlOutput() {
+export function modeControlOutput(intercept?: (line: string) => boolean) {
   const decoder = new StringDecoder("utf8");
   let pending = "";
   return new Transform({
@@ -40,14 +40,15 @@ export function modeControlOutput() {
       pending += decoder.write(chunk);
       let end;
       while ((end = pending.indexOf("\n")) !== -1) {
-        this.push(presentModeControls(pending.slice(0, end)) + "\n");
+        const line = pending.slice(0, end);
+        if (!intercept?.(line)) this.push(presentModeControls(line) + "\n");
         pending = pending.slice(end + 1);
       }
       done();
     },
     flush(done) {
       pending += decoder.end();
-      if (pending) this.push(presentModeControls(pending));
+      if (pending && !intercept?.(pending)) this.push(presentModeControls(pending));
       done();
     },
   });

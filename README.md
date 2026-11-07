@@ -108,7 +108,7 @@ Planning and permissions are separate controls:
 | --- | --- | --- |
 | Work mode | Plan | Selects the CLI's native Plan mode. Use it to research and outline a task. |
 | Work mode | Build | Implement the task using native Accept edits behavior and the selected BB permission policy. |
-| Permissions | Accept edits | Uses native Accept edits behavior; remaining ACP approval requests are presented in BB. |
+| Permissions | Accept edits | Uses native Accept edits behavior; remaining ACP approval requests are presented in BB unless automatic approval is enabled. |
 | Permissions | Full access | BB's shared bridge automatically approves ACP permission requests. |
 
 Choose **Build** or **Plan** in the **Mode** selector. Build is the default. The CLI's combined Default / Accept edits / Plan selector is replaced by these two work modes, so editing permissions are no longer repeated there. The separate Plan action is removed. BB's Auto permission mode is unsupported by the shared ACP bridge.
@@ -117,7 +117,7 @@ Choose **Build** or **Plan** in the **Mode** selector. Build is the default. The
 
 The plugin inherits the CLI's sandbox settings; it does not add `--sandbox` or force sandboxing off. Antigravity supports an OS-level terminal sandbox on supported systems. Its availability and boundaries depend on your OS, CLI version, and configuration. See [Antigravity's sandbox documentation](https://antigravity.google/docs/sandbox/?tab=cli).
 
-**Full access does not guarantee sandbox containment.** Even with the CLI sandbox enabled, a command can request execution outside it. Full access automatically approves ACP permission requests, potentially including those escape requests. Use Accept edits to retain review of requests forwarded to BB.
+**Full access does not guarantee sandbox containment.** Even with the CLI sandbox enabled, a command can request execution outside it. Full access automatically approves ACP permission requests, potentially including those escape requests. Use Accept edits with automatic approval off to retain review of requests forwarded to BB.
 
 Plan is agent behavior, not enforced read-only access. Permission approvals and terminal sandboxing are distinct protections.
 
@@ -127,7 +127,9 @@ Open **Settings -> Installed plugins -> Antigravity CLI** and use **Enable Antig
 
 The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. Off means inherit CLI settings, not force sandboxing off. Availability depends on the host OS.
 
-The plugin stores these two boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
+**Automatically approve ACP permission requests** is off by default. When enabled, the plugin answers Antigravity ACP permission requests automatically in Accept edits mode, including commands requesting execution outside the CLI sandbox. It takes effect on new turns, keeps the selected BB permission mode and direct ACP filesystem restrictions, and does not override a host policy that denies permission escalation. Requests without an allow option and other interactions continue to BB. Full access already auto-approves these requests.
+
+The plugin stores these three boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
 ## Limitations
 

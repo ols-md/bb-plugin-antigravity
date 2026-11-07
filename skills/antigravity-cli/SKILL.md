@@ -37,7 +37,7 @@ Work mode and permissions are separate controls:
   - `accept-edits` (**Build**, default): implement the task under the active permission policy.
   - `plan` (**Plan**): research and plan before implementation (behavioral mode, not enforced read-only access).
 - **Permission mode (`--permission-mode <accept-edits|full>`)**:
-  - `accept-edits`: workspace edits run with native Accept edits behavior; remaining ACP permission requests surface in BB.
+  - `accept-edits`: workspace edits run with native Accept edits behavior; remaining ACP permission requests surface in BB unless automatic approval is enabled.
   - `full`: auto-approves ACP permission requests, including requests to run outside the CLI terminal sandbox.
   - `auto` is not supported by the shared ACP bridge.
 
@@ -48,6 +48,7 @@ Work mode and permissions are separate controls:
 - Plugin settings (`Settings -> Installed plugins -> Antigravity CLI`):
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.
   - `sandbox` (default `false`): pass `--sandbox` when starting new threads (when `false`, inherits CLI settings).
+  - `autoApprove` (default `false`): automatically answer ACP permission requests in Accept edits mode on new turns, including requests to run outside the CLI sandbox. It preserves the selected permission mode and direct ACP filesystem restrictions; host policy denying escalation still applies. Full access already auto-approves requests.
 
 ## Usage and quota limits
 
