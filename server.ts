@@ -11,6 +11,12 @@ const launchSpec = {
 export default async function antigravity(bb: BbPluginApi) {
   registerAntigravityUsageSource(bb);
   const settings = bb.settings.define({
+    autoApprove: {
+      type: "boolean",
+      label: "Automatically approve ACP permission requests",
+      description: "Automatically answer Antigravity permission requests, including commands outside the CLI sandbox. Applies to new turns.",
+      default: false,
+    },
     sandbox: {
       type: "boolean",
       label: "Request CLI terminal sandbox",
@@ -40,6 +46,7 @@ export default async function antigravity(bb: BbPluginApi) {
     },
     deriveProviderOptions({ settings }) {
       return {
+        autoApprove: settings.autoApprove === true,
         acpLaunchSpec: {
           ...launchSpec,
           args: [...launchSpec.args, ...(settings.sandbox === true ? ["--sandbox"] : [])],
