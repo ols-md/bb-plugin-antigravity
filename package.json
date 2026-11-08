@@ -7,6 +7,9 @@
   "files": [
     "server.ts",
     "host.ts",
+    "background-tasks.ts",
+    "subagents.ts",
+    "dialect.ts",
     "prompt-mode.ts",
     "mode-controls.ts",
     "usage.ts",

@@ -94,10 +94,11 @@ test('completion announcements settle once and bound each result', t => {
   assert.deepEqual(tr.inspectTextForCompletions('t', 'Task id "a" terminated'), []);
   assert.equal(tr.getActiveTasks('t').length, 0);
 });
-test('bridge correlation consumes latest event and inspects all text fields', t => {
+test('bridge correlation consumes queued events and inspects all text fields', t => {
   const tr = tracker(t);
   tr.recordToolEvent(command('id', { status: 'in_progress' })); tr.recordToolEvent(command('id'));
   const line = JSON.stringify({ jsonrpc: '2.0', method: 'thread/delta', params: { threadId: 't', deltas: [{ key: { providerItemId: 'call:id' } }] } });
+  assert.equal(JSON.parse(tr.processStdoutLine(line)[0]).params.deltas.length, 1);
   assert.equal(JSON.parse(tr.processStdoutLine(line)[0]).params.deltas[1].kind, 'item.open');
   assert.equal(JSON.parse(tr.processStdoutLine(line)[0]).params.deltas.length, 1);
   for (const field of ['delta', 'output', 'text']) {
@@ -113,7 +114,9 @@ test('inbound stop/discard and dispose clear tracking; snapshots cannot mutate s
   for (const method of ['thread/stop', 'thread/discard']) {
     tr.handleToolEventForThread('t', command()); const snapshot = tr.getActiveTasks('t'); snapshot[0].description = 'mutated';
     assert.equal(tr.getActiveTasks('t')[0].description, 'build');
-    tr.handleInboundRequest({ method, params: { threadId: 't' } }); assert.equal(tr.getActiveTasks('t').length, 0);
+    const [close] = tr.handleInboundRequest({ method, params: { threadId: 't' } });
+    assert.equal(close.kind, 'item.close'); assert.equal(close.status, 'interrupted'); assert.equal(close.item.taskStatus, 'stopped');
+    assert.equal(tr.getActiveTasks('t').length, 0);
   }
   assert.deepEqual(tr.handleInboundRequest(null), []); tr.dispose(); assert.deepEqual(tr.handleToolEventForThread('t', command()), []);
 });
@@ -159,4 +162,81 @@ test('structured empty subagent list closes active native agents', t => {
   const tr = tracker(t); tr.handleToolEventForThread('t', agent());
   const event = { ...manage('manage_subagents', 'list'), rawOutput: [] };
   assert.equal(tr.handleToolEventForThread('t', event)[0].status, 'completed');
+});
+
+const stdout = (tr, threadId, ...deltas) => JSON.parse(tr.processStdoutLine(JSON.stringify({ method: 'thread/delta', params: { threadId, deltas } }))[0]).params.deltas;
+test('short and qualified IDs settle the same task without matching prefixes in lists', t => {
+  const tr = tracker(t);
+  for (const action of ['status', 'kill']) {
+    tr.handleToolEventForThread('t', command('conv/task-1'));
+    const [close] = tr.handleToolEventForThread('t', manage('manage_task', action, { TaskId: 'task-1' }, 'Command exited with code 0'));
+    assert.equal(close.item.familyId, 'conv/task-1');
+    assert.equal(close.status, action === 'kill' ? 'interrupted' : 'completed');
+  }
+  tr.handleToolEventForThread('t', command('task-1'));
+  assert.equal(tr.inspectTextForCompletions('t', 'Task id "conv/task-1" was killed')[0].item.familyId, 'task-1');
+  const header = '| Start Time | Task ID | Tool | Description |\n';
+  for (const listed of ['task-10', 'conv/task-10']) {
+    tr.handleToolEventForThread('t', command('conv/task-1')); tr.handleToolEventForThread('t', command('conv/task-10'));
+    const closed = tr.handleToolEventForThread('t', manage('manage_task', 'list', {}, header + `| now | ${listed} | run_command | build |`));
+    assert.deepEqual(closed.map(d => d.item.familyId), ['conv/task-1']);
+    assert.deepEqual(tr.getActiveTasks('t').map(task => task.taskId), ['conv/task-10']); tr.clearThread('t');
+  }
+  tr.handleToolEventForThread('t', command('conv/task-1'));
+  assert.deepEqual(tr.handleToolEventForThread('t', manage('manage_task', 'list', {}, header + '| now | task-1 | run_command | build |')), []);
+  for (const id of ['agent-1', 'agent-10', 'agent.x']) tr.handleToolEventForThread('t', agent(id));
+  const closed = tr.handleToolEventForThread('t', manage('manage_subagents', 'list', {}, 'agent-10 idle\nagent-1 running\nagentXx idle'));
+  assert.deepEqual(closed.map(d => d.item.familyId), ['agent-10']);
+});
+test('FIFO correlation keeps reused tool IDs and partial input isolated per thread', t => {
+  const tr = tracker(t);
+  const key = { providerItemId: 'shared' };
+  for (const thread of ['a', 'b']) tr.recordToolEvent({ toolCallId: 'shared', title: 'run_command', status: 'in_progress', rawInput: { toolSummary: thread } });
+  for (const thread of ['a', 'b']) assert.equal(stdout(tr, thread, { kind: 'item.open', key }).length, 1);
+  for (const thread of ['a', 'b']) tr.recordToolEvent({ toolCallId: 'shared', status: 'completed', content: `Background command ID: ${thread}/task-1` });
+  for (const thread of ['a', 'b']) {
+    const deltas = stdout(tr, thread, { kind: 'item.close', key });
+    assert.equal(deltas.at(-1).item.familyId, `${thread}/task-1`);
+    assert.equal(deltas.at(-1).item.description, thread);
+  }
+  tr.inspectTextForCompletions('a', 'Task id "task-1" was killed');
+  assert.equal(tr.getActiveTasks('a').length, 0); assert.equal(tr.getActiveTasks('b').length, 1);
+});
+test('thread-scoped fallback updates work without hooks and override unscoped events', t => {
+  const tr = tracker(t);
+  const entry = update => ({ kind: 'item.close', key: { providerItemId: 'shared' }, noTurnFallback: { raw: { params: { update } } } });
+  for (const thread of ['a', 'b']) {
+    stdout(tr, thread, entry({ toolCallId: 'shared', title: 'run_command', status: 'in_progress', rawInput: { toolSummary: thread } }));
+  }
+  tr.recordToolEvent(command('wrong', { toolCallId: 'shared' }));
+  for (const thread of ['b', 'a']) {
+    const deltas = stdout(tr, thread, entry({ toolCallId: 'shared', status: 'completed', content: `Background command ID: ${thread}/task-1` }));
+    assert.equal(deltas.at(-1).item.description, thread);
+    assert.equal(deltas.at(-1).item.familyId, `${thread}/task-1`);
+  }
+  tr.clearThread('a');
+  assert.equal(stdout(tr, 'a', entry({ toolCallId: 'shared', status: 'completed', content: 'Background command ID: new' })).length, 1);
+});
+test('stream completion buffers span chunks, remain isolated, and flush at text close or boundary', t => {
+  const tr = tracker(t);
+  for (const flush of ['item.textClose', 'turn.boundary']) {
+    for (const thread of ['a', 'b']) tr.handleToolEventForThread(thread, command('id'));
+    for (const text of ['Task i', 'd "id" finished with result:\n', 'Command exited with code ', '1']) {
+      assert.equal(stdout(tr, 'a', { kind: 'item.textDelta', text }).length, 1);
+      assert.equal(tr.getActiveTasks('a').length, 1);
+    }
+    assert.equal(stdout(tr, 'b', { kind: flush }).length, 1);
+    const deltas = stdout(tr, 'a', { kind: flush });
+    assert.equal(deltas.at(-1).status, 'failed'); assert.equal(tr.getActiveTasks('b').length, 1);
+    assert.equal(stdout(tr, 'a', { kind: flush }).length, 1);
+    tr.clearThread('b');
+  }
+  tr.handleToolEventForThread('a', command('id'));
+  stdout(tr, 'a', { kind: 'item.textDelta', text: 'Task id "id" failed' }); tr.clearThread('a');
+  tr.handleToolEventForThread('a', command('id'));
+  assert.equal(stdout(tr, 'a', { kind: 'turn.boundary' }).length, 1);
+  for (const field of ['resultText', 'aggregatedOutput', 'message']) {
+    tr.handleToolEventForThread('a', command(field));
+    assert.equal(stdout(tr, 'a', { [field]: `Task id "${field}" failed` }).at(-1).status, 'failed');
+  }
 });

@@ -16,6 +16,7 @@ import {
   setToolUpdateListener,
   getCommandDescriptionsEnabled,
   setCommandDescriptionsEnabled,
+  applyThreadCommandDescriptions,
 } from '../dialect.ts';
 
 test('exports the correct dialect id and registers idempotently', () => {
@@ -762,4 +763,125 @@ test('classifyToolCall: returns null for other tools (read_file, edit_file, unkn
     }),
     null
   );
+});
+
+test('parseAntigravityCommandOutput preserves ordinary output containing Output: without headers', () => {
+  const raw = 'first line\nOutput:\nsecond line\n';
+  const parsed = parseAntigravityCommandOutput(raw);
+  assert.equal(parsed.cleanOutput, 'first line\nOutput:\nsecond line\n');
+  assert.equal(parsed.exitCode, null);
+});
+
+test('parseAntigravityCommandOutput extracts exit code with optional period', () => {
+  const rawWithPeriod = 'Command exited with code 0.\nCommand output:\nok';
+  assert.equal(parseAntigravityCommandOutput(rawWithPeriod).exitCode, 0);
+
+  const rawWithoutPeriod = 'Command exited with code 2\nCommand output:\nfailed';
+  const parsed = parseAntigravityCommandOutput(rawWithoutPeriod);
+  assert.equal(parsed.exitCode, 2);
+  assert.equal(parsed.cleanOutput, 'failed');
+});
+
+test('onToolUpdate notifies when a second completed update arrives with new output text', () => {
+  const delivered = [];
+  const unsubscribe = onToolUpdate(event => {
+    delivered.push({ id: event.toolCallId, status: event.status, content: event.content });
+  });
+
+  const eventInitial = {
+    toolCallId: 'update_out_1',
+    sessionUpdate: 'tool_call',
+    status: 'completed',
+    title: 'run_command',
+  };
+  toolIdentity(eventInitial);
+  assert.equal(delivered.length, 1);
+
+  // Identical without new output -> skipped
+  classifyToolCall(eventInitial);
+  assert.equal(delivered.length, 1);
+
+  // Second completed update arrives with output text -> notified!
+  const eventWithOutput = {
+    toolCallId: 'update_out_1',
+    sessionUpdate: 'tool_call',
+    status: 'completed',
+    title: 'run_command',
+    content: [{ type: 'text', text: 'Command finished successfully' }],
+  };
+  toolIdentity(eventWithOutput);
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[1].content[0].text, 'Command finished successfully');
+
+  unsubscribe();
+});
+
+test('classifyToolCall: invoke_subagent extracts childRef from plain-text conversationId banner', () => {
+  const event = {
+    toolCallId: 'sub_plain_1',
+    sessionUpdate: 'tool_call',
+    rawInput: {
+      Role: 'Explorer',
+      TypeName: 'research',
+      Prompt: 'Explore codebase',
+    },
+    content: [{ type: 'text', text: 'Subagent spawned with conversationId: conv_plain_1' }],
+  };
+
+  const classified = classifyToolCall(event);
+  assert.equal(classified.kind, 'delegation');
+  assert.equal(classified.childRef, 'conv_plain_1');
+  assert.equal(classified.label, 'Explorer');
+});
+
+test('applyThreadCommandDescriptions isolates commandDescriptionsEnabled per threadId across concurrent threads', () => {
+  const enabledByThread = new Map([
+    ['thread-enabled', true],
+    ['thread-disabled', false],
+  ]);
+
+  const createDeltaLine = (threadId, command, summary) =>
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'thread/delta',
+      params: {
+        threadId,
+        deltas: [
+          {
+            kind: 'item.open',
+            item: { type: 'command', command },
+            presentation: {
+              title: summary,
+              subtitle: command,
+            },
+          },
+        ],
+      },
+    });
+
+  // Thread with enabled = true retains summary title and subtitle
+  const lineEnabled = createDeltaLine('thread-enabled', 'git status', 'Check git status');
+  const resultEnabled = applyThreadCommandDescriptions(lineEnabled, enabledByThread);
+  assert.equal(resultEnabled, lineEnabled);
+  const parsedEnabled = JSON.parse(resultEnabled);
+  assert.equal(parsedEnabled.params.deltas[0].presentation.title, 'Check git status');
+  assert.equal(parsedEnabled.params.deltas[0].presentation.subtitle, 'git status');
+
+  // Thread with enabled = false replaces summary title with command line and deletes subtitle
+  const lineDisabled = createDeltaLine('thread-disabled', 'git status', 'Check git status');
+  const resultDisabled = applyThreadCommandDescriptions(lineDisabled, enabledByThread);
+  assert.notEqual(resultDisabled, lineDisabled);
+  const parsedDisabled = JSON.parse(resultDisabled);
+  assert.equal(parsedDisabled.params.deltas[0].presentation.title, 'git status');
+  assert.equal(parsedDisabled.params.deltas[0].presentation.subtitle, undefined);
+
+  // Fallback to getCommandDescriptionsEnabled() when thread not in map
+  setCommandDescriptionsEnabled(true);
+  const lineFallback = createDeltaLine('thread-unknown', 'npm test', 'Run tests');
+  assert.equal(applyThreadCommandDescriptions(lineFallback, enabledByThread), lineFallback);
+
+  // Non-delta messages and invalid JSON pass through unchanged
+  assert.equal(applyThreadCommandDescriptions('not json', enabledByThread), 'not json');
+  const otherMessage = JSON.stringify({ method: 'session/update' });
+  assert.equal(applyThreadCommandDescriptions(otherMessage, enabledByThread), otherMessage);
 });

@@ -49,13 +49,31 @@ export function extractToolOutputText(event: RecordedToolEvent): string {
   return [extract(event.content), extract(event.rawOutput)].filter(Boolean).join('\n');
 }
 const first = (...values: unknown[]): string => values.find(v => typeof v === 'string' && v.trim())?.toString().trim() ?? '';
+function containsTaskToken(text: string, token: string): boolean {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![A-Za-z0-9_/-])${escaped}(?![A-Za-z0-9_/-])`).test(text);
+}
+
+function mergeToolEvent(previous: RecordedToolEvent | undefined, event: RecordedToolEvent): RecordedToolEvent {
+  return {
+    ...previous, ...event,
+    title: event.title ?? previous?.title,
+    kind: event.kind ?? previous?.kind,
+    status: event.status ?? previous?.status,
+    rawInput: previous?.rawInput && event.rawInput ? { ...previous.rawInput, ...event.rawInput } : event.rawInput ?? previous?.rawInput,
+    rawOutput: event.rawOutput ?? previous?.rawOutput,
+    content: event.content ?? previous?.content,
+  };
+}
 
 export function createBackgroundTaskTracker(options: {
   pollIntervalMs?: number;
   onAsyncDeltas?: (threadId: string, deltas: BackgroundTaskDelta[]) => void;
 } = {}) {
   const threads = new Map<string, Map<string, BackgroundTask>>();
-  const pending = new Map<string, RecordedToolEvent>();
+  const pending = new Map<string, RecordedToolEvent[]>();
+  const threadTools = new Map<string, Map<string, RecordedToolEvent>>();
+  const streamBuffers = new Map<string, string>();
   const watchers = new Map<string, Map<string, { offset: number; partial: string; decoder: StringDecoder }>>();
   let timer: ReturnType<typeof setInterval> | undefined;
   let disposed = false;
@@ -87,7 +105,7 @@ export function createBackgroundTaskTracker(options: {
     const tasks = threads.get(thread);
     const results: BackgroundTaskDelta[] = [];
     for (const [key, task] of tasks ?? []) {
-      if (task.taskId === id && (!type || task.taskType === type)) { tasks!.delete(key); results.push(delta(task, status, taskStatus, summary)); }
+      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); results.push(delta(task, status, taskStatus, summary)); }
     }
     if (!tasks?.size) threads.delete(thread);
     syncPolling();
@@ -151,7 +169,10 @@ export function createBackgroundTaskTracker(options: {
         return settle(thread, id, failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', text, 'local_bash');
       }
       if (action === 'list' && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
-        for (const task of getActiveTasks(thread)) if (task.taskType === 'local_bash' && !text.includes(task.taskId)) results.push(...settle(thread, task.taskId, 'completed', 'completed', text, task.taskType));
+        for (const task of getActiveTasks(thread)) {
+          const present = containsTaskToken(text, task.taskId) || containsTaskToken(text, task.taskId.split('/').pop()!);
+          if (task.taskType === 'local_bash' && !present) results.push(...settle(thread, task.taskId, 'completed', 'completed', text, task.taskType));
+        }
       }
     }
     if (name === 'manage_subagents') {
@@ -160,7 +181,7 @@ export function createBackgroundTaskTracker(options: {
       for (const task of getActiveTasks(thread)) {
         if (task.taskType !== 'local_subagent') continue;
         const kill = action === 'kill_all' || (action === 'kill' && Array.isArray(input.ConversationIds) && input.ConversationIds.includes(task.taskId));
-        const line = text.split('\n').find(line => line.includes(task.taskId));
+        const line = text.split('\n').find(line => containsTaskToken(line, task.taskId));
         if (kill || (action === 'list' && (empty || (line && /\bidle\b|\bdone\b|\bcompleted\b|\bkilled\b|\bstopped\b/i.test(line))))) results.push(...settle(thread, task.taskId, kill ? 'interrupted' : 'completed', kill ? 'killed' : 'completed', text, task.taskType));
       }
     }
@@ -192,21 +213,14 @@ export function createBackgroundTaskTracker(options: {
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
     const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
-    threads.delete(thread); syncPolling(); return results;
+    threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); syncPolling(); return results;
   }
   return {
     recordToolEvent(event: RecordedToolEvent) {
       if (disposed) return;
-      const prev = pending.get(event.toolCallId);
-      pending.set(event.toolCallId, prev ? {
-        ...prev,
-        ...event,
-        title: event.title ?? prev.title,
-        kind: event.kind ?? prev.kind,
-        rawInput: prev.rawInput && event.rawInput ? { ...prev.rawInput, ...event.rawInput } : (event.rawInput ?? prev.rawInput),
-        rawOutput: event.rawOutput ?? prev.rawOutput,
-        content: event.content ?? prev.content,
-      } : event);
+      const queue = pending.get(event.toolCallId) ?? [];
+      queue.push(event);
+      pending.set(event.toolCallId, queue);
     },
     handleToolEventForThread, inspectTextForCompletions, getActiveTasks, clearThread,
     processStdoutLine(line: string): string[] {
@@ -216,13 +230,34 @@ export function createBackgroundTaskTracker(options: {
       if (message?.method !== 'thread/delta' || typeof params?.threadId !== 'string' || !Array.isArray(params.deltas)) return [line];
       const extra: BackgroundTaskDelta[] = [];
       for (const entry of params.deltas) {
-        const id = entry?.key?.providerItemId;
-        const event = pending.get(id);
-        if (event && (event.status === 'completed' || event.status === 'failed' || entry?.kind === 'item.close')) {
-          pending.delete(id);
-          extra.push(...handleToolEventForThread(params.threadId, event));
+        const update = entry?.noTurnFallback?.raw?.params?.update;
+        const id = entry?.key?.providerItemId ?? update?.toolCallId;
+        if (typeof id === 'string') {
+          const queue = pending.get(id);
+          const queued = queue?.shift();
+          if (!queue?.length) pending.delete(id);
+          // The fallback update belongs to this exact thread; prefer it over the unscoped hook.
+          const event = update && typeof update === 'object' ? { ...update, toolCallId: id } as RecordedToolEvent : queued;
+          if (event) {
+            const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
+            const merged = mergeToolEvent(tools.get(id), event);
+            tools.set(id, merged); threadTools.set(params.threadId, tools);
+            if (merged.status === 'completed' || merged.status === 'failed' || entry?.kind === 'item.close') {
+              extra.push(...handleToolEventForThread(params.threadId, merged));
+            }
+          }
         }
-        for (const text of [entry?.text, entry?.resultText, entry?.aggregatedOutput, entry?.message, entry?.delta?.text, entry?.item?.output, entry?.item?.text]) {
+        if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
+          streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
+        } else if (typeof entry?.text === 'string') {
+          extra.push(...inspectTextForCompletions(params.threadId, entry.text));
+        }
+        if (entry?.kind === 'item.textClose' || entry?.kind === 'turn.boundary') {
+          const buffered = streamBuffers.get(params.threadId);
+          streamBuffers.delete(params.threadId);
+          if (buffered) extra.push(...inspectTextForCompletions(params.threadId, buffered));
+        }
+        for (const text of [entry?.resultText, entry?.aggregatedOutput, entry?.message, entry?.delta?.text, entry?.item?.output, entry?.item?.text]) {
           if (typeof text === 'string') extra.push(...inspectTextForCompletions(params.threadId, text));
         }
       }
@@ -231,8 +266,8 @@ export function createBackgroundTaskTracker(options: {
     },
     handleInboundRequest(request: unknown): BackgroundTaskDelta[] {
       const message = request as { method?: string; params?: { threadId?: string } } | null;
-      return message && /^(thread\/stop|thread\/discard)$/.test(message.method ?? '') && typeof message.params?.threadId === 'string' ? clearThread(message.params.threadId) : [];
+      return message && /^(thread\/stop|thread\/discard)$/.test(message.method ?? '') && typeof message.params?.threadId === 'string' ? clearThread(message.params.threadId, true) : [];
     },
-    dispose() { disposed = true; threads.clear(); pending.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
+    dispose() { disposed = true; threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
   };
 }

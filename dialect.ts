@@ -104,10 +104,75 @@ export function setCommandDescriptionsEnabled(enabled: boolean): void {
   commandDescriptionsEnabled = enabled;
 }
 
+export function applyThreadCommandDescriptions(
+  line: string,
+  enabledByThread: ReadonlyMap<string, boolean>
+): string {
+  let message: any;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return line;
+  }
+
+  const params = message?.params;
+  if (
+    message?.method !== "thread/delta" ||
+    typeof params?.threadId !== "string" ||
+    !Array.isArray(params.deltas)
+  ) {
+    return line;
+  }
+
+  const enabled = enabledByThread.get(params.threadId) ?? getCommandDescriptionsEnabled();
+  let modified = false;
+
+  for (const delta of params.deltas) {
+    if (delta?.item?.type === "command" && delta?.presentation && typeof delta.presentation === "object") {
+      if (
+        !enabled &&
+        typeof delta.item.command === "string" &&
+        delta.item.command.length > 0 &&
+        delta.presentation.subtitle === delta.item.command
+      ) {
+        delta.presentation.title = delta.item.command;
+        delete delta.presentation.subtitle;
+        modified = true;
+      }
+    }
+  }
+
+  return modified ? JSON.stringify(message) : line;
+}
+
+function extractEventOutputText(event: AcpToolUpdateEvent): string {
+  const parts: string[] = [];
+  function collect(val: unknown) {
+    if (typeof val === "string") {
+      parts.push(val);
+    } else if (Array.isArray(val)) {
+      for (const item of val) collect(item);
+    } else if (val && typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      if (typeof obj.text === "string") parts.push(obj.text);
+      if (typeof obj.output === "string") parts.push(obj.output);
+      if (typeof obj.content === "string") parts.push(obj.content);
+      if (typeof obj.stdout === "string") parts.push(obj.stdout);
+      if (typeof obj.stderr === "string") parts.push(obj.stderr);
+      if (obj.content && typeof obj.content === "object" && obj.content !== null) {
+        collect(obj.content);
+      }
+    }
+  }
+  if (event.content !== undefined) collect(event.content);
+  if (event.rawOutput !== undefined) collect(event.rawOutput);
+  return parts.join("\n");
+}
+
 // Event hook & deduplication
 type ToolUpdateListener = (event: AcpToolUpdateEvent) => void;
 const toolUpdateListeners = new Set<ToolUpdateListener>();
-const lastNotifiedSteps = new Map<string, { stepKey: string; hasInput: boolean; hasTitle: boolean }>();
+const lastNotifiedSteps = new Map<string, { stepKey: string; hasInput: boolean; hasTitle: boolean; outputText: string }>();
 const normalizedExitCodes = new WeakMap< object, number >();
 
 export function onToolUpdate(listener: ToolUpdateListener): () => void {
@@ -129,12 +194,19 @@ function notifyToolUpdate(event: AcpToolUpdateEvent): void {
   const toolCallId = event.toolCallId;
   const status = event.status ?? "";
   const stepKey = `${toolCallId}:${status}`;
-  const hasInput = Boolean(event.rawInput && typeof event.rawInput === "object");
+  const hasInput = Boolean(event.rawInput && typeof event.rawInput === "object" && Object.keys(event.rawInput).length > 0);
   const hasTitle = typeof event.title === "string" && event.title.length > 0;
+  const outputText = extractEventOutputText(event);
 
   if (toolCallId) {
     const prev = lastNotifiedSteps.get(toolCallId);
-    if (prev && prev.stepKey === stepKey && (prev.hasInput || !hasInput) && (prev.hasTitle || !hasTitle)) {
+    if (
+      prev &&
+      prev.stepKey === stepKey &&
+      (prev.hasInput || !hasInput) &&
+      (prev.hasTitle || !hasTitle) &&
+      prev.outputText === outputText
+    ) {
       return;
     }
     if (lastNotifiedSteps.size > 1000) {
@@ -144,6 +216,7 @@ function notifyToolUpdate(event: AcpToolUpdateEvent): void {
       stepKey,
       hasInput: Boolean(prev?.hasInput || hasInput),
       hasTitle: Boolean(prev?.hasTitle || hasTitle),
+      outputText,
     });
   }
 
@@ -357,15 +430,17 @@ export function parseAntigravityCommandOutput(rawText: string): {
     return { cleanOutput: "", exitCode: null, isBackgrounded: false, backgroundTaskId: null };
   }
 
-  const exitCodeMatch = rawText.match(/^(?:The c|C)ommand exited with code (-?\d+)\./m);
+  const exitCodeMatch = rawText.match(/^(?:The c|C)ommand exited with code (-?\d+)\b\.?/m);
   const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : null;
 
   const bgMatch = rawText.match(/Tool is running as a background task with task id:\s*([^\r\n]+)/i);
   const isBackgrounded = Boolean(bgMatch);
   const backgroundTaskId = bgMatch ? bgMatch[1].trim() : null;
 
-  // Check for "Command output:\n" or "Output:\n"
-  const headerSplitMatch = rawText.match(/^(?:[\s\S]*?\r?\n)?(?:Command output|Output):\r?\n/i);
+  // Strict check for Antigravity wrapper header before "Command output:\n" or "Output:\n"
+  const headerSplitMatch = rawText.match(
+    /^(?:(?:Created At:[^\r\n]*|Completed At:[^\r\n]*|(?:The c|C)ommand exited with code -?\d+\b[^\r\n]*|The user changed the command to be run to:[^\r\n]*|There were sandbox errors[^\r\n]*|This command includes call\(s\) to[^\r\n]*|[ \t]*)\r?\n)*(?:Command output|Output):\r?\n/i
+  );
   let cleanOutput: string;
   if (headerSplitMatch) {
     cleanOutput = rawText.slice(headerSplitMatch[0].length);
@@ -373,7 +448,7 @@ export function parseAntigravityCommandOutput(rawText: string): {
     cleanOutput = rawText
       .replace(/^Created At:[^\r\n]*(?:\r?\n)?/gm, "")
       .replace(/^Completed At:[^\r\n]*(?:\r?\n)?/gm, "")
-      .replace(/^(?:The c|C)ommand exited with code -?\d+\.[^\r\n]*(?:\r?\n)?/gm, "")
+      .replace(/^(?:The c|C)ommand exited with code -?\d+\b\.?[^\r\n]*(?:\r?\n)?/gm, "")
       .replace(/^\r?\n+/, "");
   }
 
@@ -383,30 +458,6 @@ export function parseAntigravityCommandOutput(rawText: string): {
     isBackgrounded,
     backgroundTaskId,
   };
-}
-
-function extractEventOutputText(event: AcpToolUpdateEvent): string {
-  const parts: string[] = [];
-  function collect(val: unknown) {
-    if (typeof val === "string") {
-      parts.push(val);
-    } else if (Array.isArray(val)) {
-      for (const item of val) collect(item);
-    } else if (val && typeof val === "object") {
-      const obj = val as Record<string, unknown>;
-      if (typeof obj.text === "string") parts.push(obj.text);
-      if (typeof obj.output === "string") parts.push(obj.output);
-      if (typeof obj.content === "string") parts.push(obj.content);
-      if (typeof obj.stdout === "string") parts.push(obj.stdout);
-      if (typeof obj.stderr === "string") parts.push(obj.stderr);
-      if (obj.content && typeof obj.content === "object" && obj.content !== null) {
-        collect(obj.content);
-      }
-    }
-  }
-  if (event.content !== undefined) collect(event.content);
-  if (event.rawOutput !== undefined) collect(event.rawOutput);
-  return parts.join("\n");
 }
 
 // Normalization & Command Result
@@ -610,7 +661,9 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
           : undefined;
 
       const outputText = extractEventOutputText(event);
-      const convMatch = outputText.match(/"conversationId"\s*:\s*"([^"]+)"/);
+      const convMatch =
+        outputText.match(/"conversationId"\s*:\s*"([^"]+)"/) ??
+        outputText.match(/Subagent spawned[^\r\n]*conversationId:\s*([^\s\r\n,]+)/i);
       const conversationId =
         convMatch?.[1] ??
         (event.rawOutput && typeof event.rawOutput === "object" && typeof (event.rawOutput as Record<string, unknown>).conversationId === "string"

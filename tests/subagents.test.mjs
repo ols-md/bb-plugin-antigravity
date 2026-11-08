@@ -57,3 +57,23 @@ test('denies matching approvals only when disabled and denial is available', () 
   c.clearThread('a');
   assert.equal(c.interceptSubagentApproval(JSON.stringify(approval('a'))), false);
 });
+
+test('recognizes dynamic titles and distinguishes approvals without a deny option', () => {
+  const replies = [];
+  const c = createSubagentController({ replyToBridge: line => replies.push(JSON.parse(line)) });
+  c.rememberAndTransformRequest(request('thread/start', 'a', { providerOptions: { subagentsDisabled: true } }));
+  for (const title of ['Define subagent reviewer', 'Message agent_42', 'List subagents', 'Stop subagents', 'Stop subagent', 'Manage subagents']) {
+    assert.equal(isNativeSubagentTool(`  ${title.toUpperCase()}  `), true);
+    const message = approval('a', { kind: 'tool_use', presentation: { title } });
+    assert.equal(c.interceptSubagentApproval(JSON.stringify(message)), true);
+    message.params.payload.availableDecisions = ['allow_once'];
+    assert.equal(c.isSubagentApprovalForDisabledThread(message), true);
+    assert.equal(c.isBlockedSubagentApproval(message), false);
+    assert.equal(c.interceptSubagentApproval(JSON.stringify(message)), false);
+  }
+  assert.equal(replies.length, 6);
+  assert.equal(c.isSubagentApprovalForDisabledThread(approval('b', undefined, ['allow_once'])), false);
+  const invalid = approval('a');
+  invalid.params.payload.availableDecisions = null;
+  assert.equal(c.isSubagentApprovalForDisabledThread(invalid), false);
+});

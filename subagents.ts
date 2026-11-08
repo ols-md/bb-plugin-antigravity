@@ -9,7 +9,7 @@ export const BB_SUBAGENT_DELEGATION_INSTRUCTIONS = "Native Antigravity subagent 
 export function isNativeSubagentTool(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const name = value.trim().toLowerCase();
-  return ANTIGRAVITY_SUBAGENT_TOOLS.has(name) || titles.has(name);
+  return ANTIGRAVITY_SUBAGENT_TOOLS.has(name) || titles.has(name) || /^(?:define subagent\s+\S+|message\s+\S+|list subagents|stop subagents?|manage subagents)$/i.test(name);
 }
 
 export function resolveProviderSubagentsEnabled(providerOptions: Record<string, unknown> | undefined, previousValue = true): boolean {
@@ -54,9 +54,12 @@ export function createSubagentController(options: { replyToBridge?: (line: strin
     const transformed = { ...request, params: { ...params, options: { ...originalOptions, instructions } } };
     return { line: JSON.stringify(transformed), parsed: transformed, providerSubagentsEnabled: enabled };
   }
-  function isBlockedSubagentApproval(message: unknown): boolean {
+  function isSubagentApprovalForDisabledThread(message: unknown): boolean {
     const m = record(message), params = record(m?.params), payload = record(params?.payload), subject = record(payload?.subject);
-    return m?.jsonrpc === "2.0" && m.method === "interaction/request" && (typeof m.id === "string" || typeof m.id === "number") && typeof params?.threadId === "string" && isSubagentsDisabled(params.threadId) && payload?.kind === "approval" && subject?.kind === "tool_use" && (isNativeSubagentTool(subject.tool) || isNativeSubagentTool(subject.presentation?.title) || isNativeSubagentTool(subject.presentation?.label?.pending)) && Array.isArray(payload.availableDecisions) && payload.availableDecisions.includes("deny");
+    return m?.jsonrpc === "2.0" && m.method === "interaction/request" && (typeof m.id === "string" || typeof m.id === "number") && typeof params?.threadId === "string" && isSubagentsDisabled(params.threadId) && payload?.kind === "approval" && subject?.kind === "tool_use" && (isNativeSubagentTool(subject.tool) || isNativeSubagentTool(subject.presentation?.title) || isNativeSubagentTool(subject.presentation?.label?.pending)) && Array.isArray(payload.availableDecisions);
+  }
+  function isBlockedSubagentApproval(message: unknown): boolean {
+    return isSubagentApprovalForDisabledThread(message) && record(record(record(message)?.params)?.payload)!.availableDecisions.includes("deny");
   }
   function interceptSubagentApproval(line: string): boolean {
     let message: any;
@@ -65,11 +68,12 @@ export function createSubagentController(options: { replyToBridge?: (line: strin
     options.replyToBridge(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { decision: "deny", grantedPermissions: null } }));
     return true;
   }
-  return { rememberAndTransformRequest, isSubagentsDisabled, isBlockedSubagentApproval, interceptSubagentApproval, clearThread };
+  return { rememberAndTransformRequest, isSubagentsDisabled, isSubagentApprovalForDisabledThread, isBlockedSubagentApproval, interceptSubagentApproval, clearThread };
 }
 
 const defaultController = createSubagentController({ replyToBridge: line => queueMicrotask(() => experimental_acpProviderBridge.handleLine(line)) });
 export const rememberSubagentSetting = defaultController.rememberAndTransformRequest;
 export const transformSubagentRequest = defaultController.rememberAndTransformRequest;
 export const isSubagentsDisabled = defaultController.isSubagentsDisabled;
+export const isSubagentApprovalForDisabledThread = defaultController.isSubagentApprovalForDisabledThread;
 export const interceptSubagentApproval = defaultController.interceptSubagentApproval;
