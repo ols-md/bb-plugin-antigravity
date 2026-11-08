@@ -2,7 +2,7 @@
 
 Use your Antigravity CLI sign-in to work inside BB. Choose models discovered from the CLI, read streamed replies, and review tool approval requests in your thread. Choose Build or Plan in the Mode selector, and show or hide the provider in the plugin settings.
 
-BB can list native personal and workspace Antigravity skills and display per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's usage sidebar and settings. A separate setting requests the CLI terminal sandbox for new threads; off inherits CLI settings.
+BB can list native personal and workspace Antigravity skills, show live background command and agent indicators above the composer and in the sidebar, render rich tool cards (with `toolSummary` descriptions, exit codes, and **Outside of sandbox** badges), optionally redirect subagent delegation to BB threads, and display per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's usage sidebar and settings. A separate setting requests the CLI terminal sandbox for new threads; off inherits CLI settings.
 
 ## Permissions and sandbox
 

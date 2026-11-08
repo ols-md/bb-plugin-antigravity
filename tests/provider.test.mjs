@@ -6,7 +6,16 @@ import { experimental_acpLaunchSpecSchema } from '@get-bb/plugin-sdk/provider-br
 test('registers a native ACP provider without changing credentials or bypassing approvals', async () => {
   const declarations = [];
   await plugin({
-    settings: { define(descriptors) { assert.equal(descriptors.autoApprove.default, false); return { get: async () => ({ enabled: true }), onChange() {} }; } },
+    settings: {
+      define(descriptors) {
+        assert.equal(descriptors.autoApprove.default, false);
+        assert.equal(descriptors.sandbox.default, false);
+        assert.equal(descriptors.subagentsDisabled.default, false);
+        assert.equal(descriptors.commandDescriptionsEnabled.default, true);
+        assert.equal(descriptors.enabled.default, true);
+        return { get: async () => ({ enabled: true }), onChange() {} };
+      },
+    },
     providers: { register(value) { declarations.push(value); return { dispose() {} }; } },
   });
   assert.equal(declarations.length, 1);
@@ -23,7 +32,7 @@ test('registers a native ACP provider without changing credentials or bypassing 
   assert.deepEqual(provider.capabilities.permissionModes, ['accept-edits', 'full']);
   assert.deepEqual(provider.capabilities.reasoningLevels, ['low', 'medium', 'high']);
   assert.deepEqual(provider.maintenance, { health: true, usage: true, installation: false });
-  assert.equal(provider.experimental_bridgeOptions.acpDialect, 'acp');
+  assert.equal(provider.experimental_bridgeOptions.acpDialect, 'antigravity');
 });
 
 
@@ -39,9 +48,22 @@ test('sandbox is opt-in and only changes fixed CLI arguments', async () => {
     assert.deepEqual(spec.args, ['acp', '--disable-telemetry', ...(sandbox === true ? ['--sandbox'] : [])]);
     assert.equal(spec.command, 'agy');
     assert.deepEqual(spec.env, {});
+    assert.equal(options.acpDialect, 'antigravity');
   }
   for (const autoApprove of [undefined, false, true, 'true']) {
     assert.equal(provider.deriveProviderOptions({ settings: { autoApprove } }).autoApprove, autoApprove === true);
+  }
+  for (const subagentsDisabled of [undefined, false, true, 'true']) {
+    assert.equal(
+      provider.deriveProviderOptions({ settings: { subagentsDisabled } }).providerSubagentsEnabled,
+      subagentsDisabled !== true
+    );
+  }
+  for (const commandDescriptionsEnabled of [undefined, false, true, 'false']) {
+    assert.equal(
+      provider.deriveProviderOptions({ settings: { commandDescriptionsEnabled } }).commandDescriptionsEnabled,
+      commandDescriptionsEnabled !== false
+    );
   }
   assert.ok(provider.experimental_nativeSkillRoots.user.includes('.gemini/antigravity-cli/skills'));
   assert.ok(provider.experimental_nativeSkillRoots.project.includes('.agents/skills'));

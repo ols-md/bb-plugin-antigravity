@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { ANTIGRAVITY_ACP_DIALECT_ID } from "./dialect.ts";
 import { registerAntigravityUsageSource } from "./usage.ts";
 
 const launchSpec = {
@@ -23,6 +24,18 @@ export default async function antigravity(bb: BbPluginApi) {
       description: "Add --sandbox for new threads. Otherwise use CLI settings. Requires a supported OS; the CLI may fall back to approval prompts. Full access can approve requests outside the sandbox.",
       default: false,
     },
+    subagentsDisabled: {
+      type: "boolean",
+      label: "Disable provider subagents",
+      description: "Prevent Antigravity CLI from using its native subagent tools so agents use bb for delegation.",
+      default: false,
+    },
+    commandDescriptionsEnabled: {
+      type: "boolean",
+      label: "Show command descriptions",
+      description: "Display Antigravity tool summaries on command execution cards.",
+      default: true,
+    },
     enabled: {
       type: "boolean",
       label: "Enable Antigravity CLI",
@@ -42,11 +55,14 @@ export default async function antigravity(bb: BbPluginApi) {
     },
     experimental_bridgeOptions: {
       acpLaunchSpec: launchSpec,
-      acpDialect: "acp",
+      acpDialect: ANTIGRAVITY_ACP_DIALECT_ID,
     },
     deriveProviderOptions({ settings }) {
       return {
         autoApprove: settings.autoApprove === true,
+        providerSubagentsEnabled: settings.subagentsDisabled !== true,
+        commandDescriptionsEnabled: settings.commandDescriptionsEnabled !== false,
+        acpDialect: ANTIGRAVITY_ACP_DIALECT_ID,
         acpLaunchSpec: {
           ...launchSpec,
           args: [...launchSpec.args, ...(settings.sandbox === true ? ["--sandbox"] : [])],
