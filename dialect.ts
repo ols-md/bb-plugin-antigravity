@@ -30,7 +30,22 @@ export interface DialectPresentation {
   };
   title?: string;
   subtitle?: string;
+  detail?: string;
+  badge?: {
+    glyph: string;
+    label: string;
+    hint: string;
+    tone: "destructive" | "neutral";
+  };
   badges?: DialectPresentationBadge[];
+}
+
+const PRESENTATION_DETAIL_MAX_LENGTH = 280;
+
+function truncatePresentationDetail(text: string): string {
+  return text.length > PRESENTATION_DETAIL_MAX_LENGTH
+    ? `${text.slice(0, PRESENTATION_DETAIL_MAX_LENGTH - 3)}...`
+    : text;
 }
 
 export type AcpDialectToolClassification =
@@ -133,10 +148,12 @@ export function applyThreadCommandDescriptions(
         !enabled &&
         typeof delta.item.command === "string" &&
         delta.item.command.length > 0 &&
-        delta.presentation.subtitle === delta.item.command
+        (delta.presentation.subtitle === delta.item.command ||
+          delta.presentation.detail === truncatePresentationDetail(delta.item.command))
       ) {
         delta.presentation.title = delta.item.command;
         delete delta.presentation.subtitle;
+        delete delta.presentation.detail;
         modified = true;
       }
     }
@@ -433,7 +450,7 @@ export function parseAntigravityCommandOutput(rawText: string): {
   const exitCodeMatch = rawText.match(/^(?:The c|C)ommand exited with code (-?\d+)\b\.?/m);
   const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : null;
 
-  const bgMatch = rawText.match(/Tool is running as a background task with task id:\s*([^\r\n]+)/i);
+  const bgMatch = rawText.match(/Tool is running as a background task with task id:[ \t]*([^\s\r\n][^\r\n]*)/i);
   const isBackgrounded = Boolean(bgMatch);
   const backgroundTaskId = bgMatch ? bgMatch[1].trim() : null;
 
@@ -619,13 +636,24 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
         ...(useToolSummary
           ? {
               title: toolSummary!.trim(),
-              subtitle: commandLine ?? undefined,
+              ...(commandLine
+                ? {
+                    detail: truncatePresentationDetail(commandLine),
+                    subtitle: commandLine,
+                  }
+                : {}),
             }
           : {
               title: commandLine || event.title || "Command",
             }),
         ...(bypassSandbox
           ? {
+              badge: {
+                glyph: "ShieldAlert",
+                label: "Outside of sandbox",
+                hint: "Command runs outside the sandbox",
+                tone: "destructive",
+              },
               badges: [{ label: "Outside of sandbox", tone: "destructive" }],
             }
           : {}),
@@ -663,7 +691,9 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
       const outputText = extractEventOutputText(event);
       const convMatch =
         outputText.match(/"conversationId"\s*:\s*"([^"]+)"/) ??
-        outputText.match(/Subagent spawned[^\r\n]*conversationId:\s*([^\s\r\n,]+)/i);
+        (/\bSubagent spawned\b/i.test(outputText)
+          ? outputText.match(/\bconversationId:[ \t]*([^\s,]+)/i)
+          : null);
       const conversationId =
         convMatch?.[1] ??
         (event.rawOutput && typeof event.rawOutput === "object" && typeof (event.rawOutput as Record<string, unknown>).conversationId === "string"
@@ -691,7 +721,12 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
         label: { pending: "Running subagent", completed: "Subagent launched" },
         icon: { glyph: "Bot" },
         title: label,
-        ...(detailParts ? { subtitle: detailParts } : {}),
+        ...(detailParts
+          ? {
+              detail: truncatePresentationDetail(detailParts),
+              subtitle: detailParts,
+            }
+          : {}),
       };
 
       return {
@@ -723,7 +758,12 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
         label: { pending: "Defining subagent", completed: "Defined subagent" },
         icon: { glyph: "Bot" },
         title: name ? `Define subagent ${name}` : "Define subagent",
-        ...(description ? { subtitle: description } : {}),
+        ...(description
+          ? {
+              detail: truncatePresentationDetail(description),
+              subtitle: description,
+            }
+          : {}),
       };
 
       return {
@@ -765,7 +805,12 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
             : action === "kill" || action === "kill_all"
               ? "Stop subagents"
               : "Manage subagents",
-        ...(ids ? { subtitle: ids } : {}),
+        ...(ids
+          ? {
+              detail: truncatePresentationDetail(ids),
+              subtitle: ids,
+            }
+          : {}),
       };
 
       return {
@@ -795,7 +840,12 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
         label: { pending: "Messaging subagent", completed: "Messaged subagent" },
         icon: { glyph: "Bot" },
         title: recipient ? `Message ${recipient}` : "Message subagent",
-        ...(message ? { subtitle: message.slice(0, 120) } : {}),
+        ...(message
+          ? {
+              detail: truncatePresentationDetail(message.slice(0, 120)),
+              subtitle: message.slice(0, 120),
+            }
+          : {}),
       };
 
       return {
@@ -881,7 +931,12 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
         label: { pending: "Scheduling task", completed: "Scheduled task" },
         icon: { glyph: "Clock" },
         title: scheduleDesc ? `Schedule (${scheduleDesc})` : "Schedule task",
-        ...(prompt ? { subtitle: prompt.slice(0, 120) } : {}),
+        ...(prompt
+          ? {
+              detail: truncatePresentationDetail(prompt.slice(0, 120)),
+              subtitle: prompt.slice(0, 120),
+            }
+          : {}),
       };
 
       return {

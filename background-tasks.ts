@@ -187,13 +187,14 @@ export function createBackgroundTaskTracker(options: {
     }
     const agent = name === 'invoke_subagent';
     const raw = event.rawOutput as Record<string, unknown> | undefined;
-    const id = agent ? first(raw?.conversationId, /"conversationId"\s*:\s*"([^"]+)"/.exec(text)?.[1], /Subagent spawned[^\r\n]*conversationId:\s*([^\s\r\n,]+)/i.exec(text)?.[1])
-      : /^(run_command|schedule)$/.test(name) ? first(/Tool is running as a background task with task id:\s*([^\r\n]+)/.exec(text)?.[1], /Background command ID:\s*([^\r\n]+)/.exec(text)?.[1]) : '';
+    const spawnedId = /\bSubagent spawned\b/i.test(text) ? /\bconversationId:[ \t]*([^\s,]+)/i.exec(text)?.[1] : undefined;
+    const id = agent ? first(raw?.conversationId, /"conversationId"\s*:\s*"([^"]+)"/.exec(text)?.[1], spawnedId)
+      : /^(run_command|schedule)$/.test(name) ? first(/Tool is running as a background task with task id:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1], /Background command ID:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1]) : '';
     if (!id) return results;
     const title = /^(run_command|schedule|invoke_subagent)$/.test(event.title ?? '') ? '' : event.title;
-    const outputFile = first(/Task logs are available at:\s*([^\r\n]+)/.exec(text)?.[1]);
+    const outputFile = first(/Task logs are available at:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1]);
     const task: BackgroundTask = { taskId: id, taskType: agent ? 'local_subagent' : 'local_bash', parentToolCallId: event.toolCallId,
-      description: agent ? first(input.Role, input.TypeName, title, id) : first(input.toolSummary, /Task Description:\s*([^\r\n]+)/.exec(text)?.[1], input.CommandLine, input.command, input.Prompt, title, id),
+      description: agent ? first(input.Role, input.TypeName, title, id) : first(input.toolSummary, /Task Description:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1], input.CommandLine, input.command, input.Prompt, title, id),
       ...(outputFile ? { outputFile: normalizeFileUri(outputFile), transcriptPath: deriveTranscriptPathFromLogFile(outputFile) ?? undefined } : {}) };
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
     if (tasks.has(taskKey(task))) return results;

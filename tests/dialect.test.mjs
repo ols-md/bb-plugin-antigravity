@@ -506,7 +506,9 @@ test('classifyToolCall: run_command with descriptions enabled and disabled', () 
   assert.equal(classified1.presentation.label.pending, 'Running command');
   assert.equal(classified1.presentation.label.completed, 'Ran command');
   assert.equal(classified1.presentation.title, 'Check git status');
+  assert.equal(classified1.presentation.detail, 'git status');
   assert.equal(classified1.presentation.subtitle, 'git status');
+  assert.equal(classified1.presentation.badge, undefined);
   assert.equal(classified1.presentation.badges, undefined);
 
   // With BypassSandbox: true
@@ -520,6 +522,12 @@ test('classifyToolCall: run_command with descriptions enabled and disabled', () 
     },
   };
   const classified2 = classifyToolCall(event2);
+  assert.deepEqual(classified2.presentation.badge, {
+    glyph: 'ShieldAlert',
+    label: 'Outside of sandbox',
+    hint: 'Command runs outside the sandbox',
+    tone: 'destructive',
+  });
   assert.deepEqual(classified2.presentation.badges, [
     { label: 'Outside of sandbox', tone: 'destructive' },
   ]);
@@ -528,6 +536,7 @@ test('classifyToolCall: run_command with descriptions enabled and disabled', () 
   setCommandDescriptionsEnabled(false);
   const classified3 = classifyToolCall(event1);
   assert.equal(classified3.presentation.title, 'git status');
+  assert.equal(classified3.presentation.detail, undefined);
   assert.equal(classified3.presentation.subtitle, undefined);
 
   // Backgrounded command
@@ -852,6 +861,7 @@ test('applyThreadCommandDescriptions isolates commandDescriptionsEnabled per thr
             item: { type: 'command', command },
             presentation: {
               title: summary,
+              detail: command,
               subtitle: command,
             },
           },
@@ -865,14 +875,16 @@ test('applyThreadCommandDescriptions isolates commandDescriptionsEnabled per thr
   assert.equal(resultEnabled, lineEnabled);
   const parsedEnabled = JSON.parse(resultEnabled);
   assert.equal(parsedEnabled.params.deltas[0].presentation.title, 'Check git status');
+  assert.equal(parsedEnabled.params.deltas[0].presentation.detail, 'git status');
   assert.equal(parsedEnabled.params.deltas[0].presentation.subtitle, 'git status');
 
-  // Thread with enabled = false replaces summary title with command line and deletes subtitle
+  // Thread with enabled = false replaces summary title with command line and deletes subtitle/detail
   const lineDisabled = createDeltaLine('thread-disabled', 'git status', 'Check git status');
   const resultDisabled = applyThreadCommandDescriptions(lineDisabled, enabledByThread);
   assert.notEqual(resultDisabled, lineDisabled);
   const parsedDisabled = JSON.parse(resultDisabled);
   assert.equal(parsedDisabled.params.deltas[0].presentation.title, 'git status');
+  assert.equal(parsedDisabled.params.deltas[0].presentation.detail, undefined);
   assert.equal(parsedDisabled.params.deltas[0].presentation.subtitle, undefined);
 
   // Fallback to getCommandDescriptionsEnabled() when thread not in map
