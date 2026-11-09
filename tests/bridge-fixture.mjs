@@ -40,6 +40,25 @@ try {
   await wait(m => JSON.stringify(m).includes('optionId'));
   assert.equal(messages.some(m => m.method === 'interaction/request'), !enabled);
   assert.match(JSON.stringify(messages), /yes/);
+  assert.match(JSON.stringify(messages), /"type":"backgroundTask"/);
+  assert.match(JSON.stringify(messages), /"familyId":"fake-session\/task-1"/);
+  assert.match(JSON.stringify(messages), /"Outside of sandbox"/);
+
+  if (enabled) {
+    const subagentOptions = {
+      ...options,
+      providerOptions: { ...options.providerOptions, subagentsDisabled: true },
+    };
+    send(4, 'turn/start', {
+      threadId: 'thread',
+      providerThreadId: started.result.providerThreadId,
+      clientRequestId: 'creq_3456789abc',
+      input: [{ type: 'text', text: 'subagent-test' }],
+      options: subagentOptions,
+    });
+    await wait(m => JSON.stringify(m).includes('\\"optionId\\":\\"no\\"'));
+  }
+
   bridge.onClose?.();
   originalWrite('verified\n');
 } catch (error) {

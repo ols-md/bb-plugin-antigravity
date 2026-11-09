@@ -23,6 +23,9 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 - **Live model discovery:** models and reasoning options come from your CLI and account.
 - **Plan and Build:** plan a task, then switch back to implementation.
 - **Permission controls:** choose Accept edits or Full access.
+- **Background task & agent indicators:** see live composer and sidebar indicators when `run_command`, `schedule`, or native subagents run in the background.
+- **BB agent delegation toggle:** optionally disable native Antigravity subagents so agents delegate work using BB threads (`bb thread spawn --parent-self`).
+- **Rich Antigravity tool cards:** view command summaries (`toolSummary`), clean command output with exit codes, destructive **Outside of sandbox** badges when `BypassSandbox` is used, and native subagent delegation cards.
 - **Native skills:** discover your workspace and personal Antigravity skills in BB.
 - **Usage & quota limits:** view per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's sidebar and usage settings.
 - **CLI sandbox setting:** request the CLI terminal sandbox for new threads.
@@ -129,7 +132,11 @@ The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. O
 
 **Automatically approve ACP permission requests** is off by default. When enabled, the plugin answers Antigravity ACP permission requests automatically in Accept edits mode, including commands requesting execution outside the CLI sandbox. It takes effect on new turns, keeps the selected BB permission mode and direct ACP filesystem restrictions, and does not override a host policy that denies permission escalation. Requests without an allow option and other interactions continue to BB. Full access already auto-approves these requests.
 
-The plugin stores these three boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
+**Disable provider subagents** is off by default. When enabled, the plugin instructs Antigravity CLI not to use its native subagent tools (`invoke_subagent`, `define_subagent`, `manage_subagents`, `send_message`) so agents delegate work through BB threads (`bb thread spawn --parent-self`), and automatically denies native subagent approval prompts (taking precedence over automatic approval).
+
+**Show command descriptions** is on by default. When enabled, command execution cards display Antigravity's `toolSummary` as the title with the raw command line as the subtitle, along with an **Outside of sandbox** badge whenever `BypassSandbox` is requested.
+
+The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
 ## Limitations
 

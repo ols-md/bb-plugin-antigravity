@@ -1,8 +1,26 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import { threadStartParamsSchema, threadResumeParamsSchema, turnStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";
+import { createBackgroundTaskTracker } from "./background-tasks.ts";
+import { ANTIGRAVITY_ACP_DIALECT_ID, applyThreadCommandDescriptions, onToolUpdate, registerAntigravityAcpDialect } from "./dialect.ts";
 import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
+import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
+
+registerAntigravityAcpDialect();
+
+let rawStdoutWrite: typeof process.stdout.write | null = null;
+export const backgroundTaskTracker = createBackgroundTaskTracker({
+  onAsyncDeltas(threadId, deltas) {
+    if (!deltas.length) return;
+    const write = rawStdoutWrite ?? process.stdout.write.bind(process.stdout);
+    write(`${JSON.stringify({ jsonrpc: "2.0", method: "thread/delta", params: { threadId, deltas } })}\n`);
+  },
+});
+
+onToolUpdate(event => {
+  backgroundTaskTracker.recordToolEvent(event as any);
+});
 
 function parseUsageRequest(parsed: unknown): { id: string | number; command: string; cwd?: string; env?: Record<string, string> } | null {
   if (!parsed || typeof parsed !== "object") return null;
@@ -26,20 +44,72 @@ function parseUsageRequest(parsed: unknown): { id: string | number; command: str
 
 let stdoutFilterInstalled = false;
 const autoApproveThreads = new Map<string, boolean>();
+const commandDescriptionsThreads = new Map<string, boolean>();
 
 export function rememberApprovalSetting(request: any) {
+  if (request?.method === "thread/stop" || request?.method === "thread/discard") {
+    const threadId = request?.params?.threadId;
+    if (typeof threadId === "string") {
+      autoApproveThreads.delete(threadId);
+      commandDescriptionsThreads.delete(threadId);
+    }
+    return;
+  }
   const schema = request?.method === "thread/start" ? threadStartParamsSchema
     : request?.method === "thread/resume" ? threadResumeParamsSchema
     : request?.method === "turn/start" ? turnStartParamsSchema : null;
   const parsed = schema?.safeParse(request.params);
-  if (parsed?.success) autoApproveThreads.set(parsed.data.threadId,
-    parsed.data.options.providerOptions?.autoApprove === true &&
-    parsed.data.options.permissionMode === "accept-edits" && parsed.data.options.permissionEscalation === "ask");
+  if (parsed?.success) {
+    const providerOptions = parsed.data.options.providerOptions;
+    if (typeof providerOptions?.commandDescriptionsEnabled === "boolean") {
+      commandDescriptionsThreads.set(parsed.data.threadId, providerOptions.commandDescriptionsEnabled);
+    }
+    autoApproveThreads.set(parsed.data.threadId,
+      providerOptions?.autoApprove === true &&
+      parsed.data.options.permissionMode === "accept-edits" && parsed.data.options.permissionEscalation === "ask");
+  }
+}
+
+function applyAntigravityDefaults(line: string, parsed: unknown): { line: string; parsed: unknown } {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { line, parsed };
+  const record = parsed as Record<string, any>;
+  const params = record.params && typeof record.params === "object" && !Array.isArray(record.params)
+    ? (record.params as Record<string, any>)
+    : null;
+  if (!params) return { line, parsed };
+  const options = params.options && typeof params.options === "object" && !Array.isArray(params.options)
+    ? (params.options as Record<string, any>)
+    : null;
+  const providerOptions = options?.providerOptions && typeof options.providerOptions === "object" && !Array.isArray(options.providerOptions)
+    ? (options.providerOptions as Record<string, any>)
+    : null;
+  if (typeof params.threadId === "string" && typeof providerOptions?.commandDescriptionsEnabled === "boolean") {
+    commandDescriptionsThreads.set(params.threadId, providerOptions.commandDescriptionsEnabled);
+  }
+  if (providerOptions && (!providerOptions.acpDialect || providerOptions.acpDialect === "acp")) {
+    const updated = {
+      ...record,
+      params: {
+        ...params,
+        options: {
+          ...options,
+          providerOptions: {
+            ...providerOptions,
+            acpDialect: ANTIGRAVITY_ACP_DIALECT_ID,
+          },
+        },
+      },
+    };
+    return { line: JSON.stringify(updated), parsed: updated };
+  }
+  return { line, parsed };
 }
 
 export function interceptApproval(line: string): boolean {
+  if (interceptSubagentApproval(line)) return true;
   let message: any;
   try { message = JSON.parse(line); } catch { return false; }
+  if (isSubagentApprovalForDisabledThread(message)) return false;
   if (message?.jsonrpc !== "2.0" || message.method !== "interaction/request" ||
       (typeof message.id !== "string" && typeof message.id !== "number") ||
       !autoApproveThreads.get(message.params?.threadId)) return false;
@@ -64,8 +134,13 @@ export function interceptApproval(line: string): boolean {
 function ensureStdoutFilter() {
   if (stdoutFilterInstalled) return;
   stdoutFilterInstalled = true;
+  registerAntigravityAcpDialect();
   const write = process.stdout.write.bind(process.stdout);
-  const output = modeControlOutput(interceptApproval);
+  rawStdoutWrite = write;
+  const output = modeControlOutput(
+    interceptApproval,
+    line => backgroundTaskTracker.processStdoutLine(applyThreadCommandDescriptions(line, commandDescriptionsThreads)),
+  );
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
     output.write(chunk, encodingOrCallback, callback)) as typeof process.stdout.write;
@@ -80,8 +155,18 @@ export const experimental_providerBridge = {
     ensureStdoutFilter();
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { parsed = null; }
-    rememberApprovalSetting(parsed);
-    const usageRequest = parseUsageRequest(parsed);
+    const withDefaults = applyAntigravityDefaults(line, parsed);
+    const subagentTransformed = transformSubagentRequest(withDefaults.line, withDefaults.parsed);
+    rememberApprovalSetting(subagentTransformed.parsed);
+    const closeDeltas = backgroundTaskTracker.handleInboundRequest(subagentTransformed.parsed);
+    if (closeDeltas.length > 0) {
+      const stopThreadId = (subagentTransformed.parsed as Record<string, any> | null)?.params?.threadId;
+      if (typeof stopThreadId === "string") {
+        const write = rawStdoutWrite ?? process.stdout.write.bind(process.stdout);
+        write(`${JSON.stringify({ jsonrpc: "2.0", method: "thread/delta", params: { threadId: stopThreadId, deltas: closeDeltas } })}\n`);
+      }
+    }
+    const usageRequest = parseUsageRequest(subagentTransformed.parsed);
     if (usageRequest !== null) {
       void readAntigravityProviderUsage({
         command: usageRequest.command,
@@ -103,6 +188,6 @@ export const experimental_providerBridge = {
       });
       return;
     }
-    experimental_acpProviderBridge.handleLine(mapPromptMode(line, parsed));
+    experimental_acpProviderBridge.handleLine(mapPromptMode(subagentTransformed.line, subagentTransformed.parsed));
   },
 };

@@ -49,6 +49,8 @@ Work mode and permissions are separate controls:
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.
   - `sandbox` (default `false`): pass `--sandbox` when starting new threads (when `false`, inherits CLI settings).
   - `autoApprove` (default `false`): automatically answer ACP permission requests in Accept edits mode on new turns, including requests to run outside the CLI sandbox. It preserves the selected permission mode and direct ACP filesystem restrictions; host policy denying escalation still applies. Full access already auto-approves requests.
+  - `subagentsDisabled` (default `false`): prevent Antigravity CLI from using its native subagent tools (`invoke_subagent`, `define_subagent`, `manage_subagents`, `send_message`) so agents delegate subtasks via BB child threads (`bb thread spawn --parent-self`), and automatically deny native subagent approval requests.
+  - `commandDescriptionsEnabled` (default `true`): show Antigravity's `toolSummary` description on command execution cards.
 
 ## Usage and quota limits
 
