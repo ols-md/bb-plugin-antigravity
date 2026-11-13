@@ -454,19 +454,40 @@ export function parseAntigravityCommandOutput(rawText: string): {
   const isBackgrounded = Boolean(bgMatch);
   const backgroundTaskId = bgMatch ? bgMatch[1].trim() : null;
 
+  // Diagnostic headers (e.g. "There were sandbox errors...") carry the reason a
+  // command failed, and are often the only information when the output section
+  // is empty. Extract them before header stripping so they survive normalization.
+  const diagnosticLines: string[] = [];
+  const body = rawText.replace(/^There were sandbox errors[^\r\n]*(?:\r?\n)?/gm, (line) => {
+    diagnosticLines.push(line.replace(/\r?\n$/, ""));
+    return "";
+  });
+
   // Strict check for Antigravity wrapper header before "Command output:\n" or "Output:\n"
-  const headerSplitMatch = rawText.match(
-    /^(?:(?:Created At:[^\r\n]*|Completed At:[^\r\n]*|(?:The c|C)ommand exited with code -?\d+\b[^\r\n]*|The user changed the command to be run to:[^\r\n]*|There were sandbox errors[^\r\n]*|This command includes call\(s\) to[^\r\n]*|[ \t]*)\r?\n)*(?:Command output|Output):\r?\n/i
+  const headerSplitMatch = body.match(
+    /^(?:(?:Created At:[^\r\n]*|Completed At:[^\r\n]*|(?:The c|C)ommand exited with code -?\d+\b[^\r\n]*|The user changed the command to be run to:[^\r\n]*|This command includes call\(s\) to[^\r\n]*|[ \t]*)\r?\n)*(?:Command output|Output):\r?\n/i
   );
   let cleanOutput: string;
   if (headerSplitMatch) {
-    cleanOutput = rawText.slice(headerSplitMatch[0].length);
+    cleanOutput = body.slice(headerSplitMatch[0].length);
   } else {
-    cleanOutput = rawText
+    cleanOutput = body
       .replace(/^Created At:[^\r\n]*(?:\r?\n)?/gm, "")
       .replace(/^Completed At:[^\r\n]*(?:\r?\n)?/gm, "")
       .replace(/^(?:The c|C)ommand exited with code -?\d+\b\.?[^\r\n]*(?:\r?\n)?/gm, "")
       .replace(/^\r?\n+/, "");
+  }
+
+  // A failed command must never normalize to an empty string: when the output
+  // section is empty, surface the diagnostic text (or the exit-code line it came
+  // from) so the failure reason reaches BB and the model.
+  if (cleanOutput.trim() === "" && (diagnosticLines.length > 0 || (exitCode !== null && exitCode !== 0))) {
+    cleanOutput =
+      diagnosticLines.length > 0
+        ? diagnosticLines.join("\n")
+        : exitCodeMatch?.[0].trim() ?? "";
+  } else if (diagnosticLines.length > 0) {
+    cleanOutput = `${diagnosticLines.join("\n")}\n${cleanOutput}`;
   }
 
   return {

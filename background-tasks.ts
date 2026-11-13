@@ -46,6 +46,15 @@ export interface BackgroundTaskDelta {
   item: Record<string, unknown>;
   presentation: Record<string, unknown>;
 }
+export interface SilentTurnInjectionDelta {
+  kind: 'item.textDelta' | 'item.textClose';
+  key: { channel: string };
+  channel: 'agentMessage';
+  text: string;
+}
+// After this many consecutive silent turns (failed empty-output command, no agent text),
+// the injected message escalates to "command execution appears broken in this session".
+export const SILENT_TURN_ESCALATION_THRESHOLD = 2;
 export function normalizeFileUri(value: string): string {
   return value.trim().replace(/^file:\/\/\/([A-Za-z]:\/)/i, '$1').replace(/^file:\/\/\//i, '/');
 }
@@ -175,6 +184,53 @@ export function createBackgroundTaskTracker(options: {
   const touchedThreads = new Set<string>();
   let lastWritten = '';
   const taskKey = (task: Pick<BackgroundTask, 'taskType' | 'taskId'>) => `${task.taskType === 'local_subagent' ? 'subagent' : 'task'}:${task.taskId}`;
+  // Silent-turn detection state (issue: turn ends with no agent message after a failed
+  // command with empty output, so BB records "No final output was recorded").
+  const silentTurns = new Map<string, { agentText: boolean; emptyFailedCommand: boolean; streak: number }>();
+  function silentState(thread: string): { agentText: boolean; emptyFailedCommand: boolean; streak: number } {
+    let state = silentTurns.get(thread);
+    if (!state) {
+      state = { agentText: false, emptyFailedCommand: false, streak: 0 };
+      silentTurns.set(thread, state);
+    }
+    return state;
+  }
+  function silentTurnMessage(streak: number): string {
+    if (streak >= SILENT_TURN_ESCALATION_THRESHOLD) {
+      return `Command execution appears broken in this session: ${streak} consecutive turns ended without an agent response after commands failed with empty output. Restart the thread runtime (reload the thread) or restart the host.`;
+    }
+    return 'The Antigravity agent ended this turn without a response after a command failed with empty output. Command execution may be broken in the CLI runtime — try reloading the thread or restarting the host.';
+  }
+  // Injected warnings reuse the exact wire shape the SDK's ACP bridge uses for genuine agent
+  // messages: an `item.textDelta` + `item.textClose` pair on the assistant stream key
+  // (`key.channel: "assistant"`, `channel: "agentMessage"`). The host delta assembler
+  // auto-opens an `agentMessage` item on the first textDelta and settles it on the textClose,
+  // recording the text as the turn's agent output. The pair must be inserted *before* the
+  // `turn.boundary` entry in the delta list: after the boundary the host closes the turn,
+  // and any text delta appended past it would be dropped instead of recorded.
+  function silentTurnInjection(text: string): SilentTurnInjectionDelta[] {
+    return [
+      { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text },
+      { kind: 'item.textClose', key: { channel: 'assistant' }, channel: 'agentMessage', text },
+    ];
+  }
+  function handleTurnBoundary(thread: string, status: unknown): string | null {
+    const state = silentState(thread);
+    const silent = !state.agentText && state.emptyFailedCommand;
+    let message: string | null = null;
+    if (status === 'completed' && silent) {
+      state.streak += 1;
+      message = silentTurnMessage(state.streak);
+    } else if (!silent) {
+      // Any turn that emitted agent text or had no such failure resets the streak.
+      state.streak = 0;
+    }
+    // Interrupted/failed boundaries with the silent pattern are ambiguous (e.g. the user
+    // stopped the turn): leave the streak untouched so a later confirmed silent turn escalates.
+    state.agentText = false;
+    state.emptyFailedCommand = false;
+    return message;
+  }
   function delta(task: BackgroundTask, status?: BackgroundTaskDelta['status'], taskStatus?: string, summary?: string): BackgroundTaskDelta {
     const agent = task.taskType === 'local_subagent';
     return {
@@ -290,7 +346,17 @@ export function createBackgroundTaskTracker(options: {
     }
   }
   function handleToolEventForThread(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
-    if (disposed || event.status !== 'completed') return [];
+    if (disposed) return [];
+    // A failed run_command event with empty/whitespace output is the exact signature of the
+    // "silent give-up" turn: record it even though no background task is registered for it.
+    if (event.status === 'failed') {
+      const inferred = inferAntigravityToolName(event as any);
+      const name = inferred ?? [event.title, event.kind].find(v => typeof v === 'string' && v.trim()) ?? '';
+      if (name === 'run_command' && !extractToolOutputText(event).trim()) {
+        silentState(thread).emptyFailedCommand = true;
+      }
+    }
+    if (event.status !== 'completed') return [];
     const input = event.rawInput ?? {};
     const text = extractToolOutputText(event);
     const inferred = inferAntigravityToolName(event as any);
@@ -353,7 +419,7 @@ export function createBackgroundTaskTracker(options: {
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
     const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
-    threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); syncPolling();
+    threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
     touchedThreads.add(thread); persistState(); return results;
   }
   // Startup load: snapshot which records predate this host process (only those are eligible for
@@ -380,6 +446,11 @@ export function createBackgroundTaskTracker(options: {
       const params = message?.params;
       if (message?.method !== 'thread/delta' || typeof params?.threadId !== 'string' || !Array.isArray(params.deltas)) return [line];
       const extra: BackgroundTaskDelta[] = [];
+      // Injected silent-turn warnings must precede the turn boundary in the delta list
+      // (after the boundary the host has already closed the turn and would drop them),
+      // so the outgoing deltas are rebuilt instead of blindly appended.
+      const ordered: unknown[] = [];
+      let boundarySeen = false;
       for (const entry of params.deltas) {
         const update = entry?.noTurnFallback?.raw?.params?.update;
         const id = entry?.key?.providerItemId ?? update?.toolCallId;
@@ -400,6 +471,10 @@ export function createBackgroundTaskTracker(options: {
         }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
           streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
+          // Visible agent text (not reasoning) marks the turn as non-silent.
+          if (entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
+            silentState(params.threadId).agentText = true;
+          }
         } else if (typeof entry?.text === 'string') {
           extra.push(...inspectTextForCompletions(params.threadId, entry.text));
         }
@@ -408,12 +483,32 @@ export function createBackgroundTaskTracker(options: {
           streamBuffers.delete(params.threadId);
           if (buffered) extra.push(...inspectTextForCompletions(params.threadId, buffered));
         }
+        if (entry?.kind === 'item.textClose' && typeof entry.text === 'string' && entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
+          silentState(params.threadId).agentText = true;
+        }
+        if (entry?.kind === 'item.open' && entry?.item?.type === 'agentMessage' && typeof entry.item.text === 'string' && entry.item.text.trim()) {
+          silentState(params.threadId).agentText = true;
+        }
+        if (entry?.kind === 'item.close' && entry?.status === 'failed' && (entry?.item?.type === 'command' || entry?.key?.channel === 'command')) {
+          // Failed command item with empty/whitespace-only output: the "silent give-up" signature.
+          const outputs = [entry?.item?.aggregatedOutput, entry?.aggregatedOutput, entry?.resultText];
+          if (outputs.every(value => value == null || (typeof value === 'string' && value.trim() === ''))) {
+            silentState(params.threadId).emptyFailedCommand = true;
+          }
+        }
+        if (entry?.kind === 'turn.boundary' && !boundarySeen) {
+          boundarySeen = true;
+          const injectedText = handleTurnBoundary(params.threadId, entry?.status);
+          if (typeof injectedText === 'string') ordered.push(...silentTurnInjection(injectedText));
+        }
+        ordered.push(entry);
         for (const text of [entry?.resultText, entry?.aggregatedOutput, entry?.message, entry?.delta?.text, entry?.item?.output, entry?.item?.text]) {
           if (typeof text === 'string') extra.push(...inspectTextForCompletions(params.threadId, text));
         }
       }
-      if (!extra.length) return [line];
-      params.deltas.push(...extra); return [JSON.stringify(message)];
+      ordered.push(...extra);
+      if (ordered.length === params.deltas.length) return [line];
+      params.deltas = ordered; return [JSON.stringify(message)];
     },
     handleInboundRequest(request: unknown): BackgroundTaskDelta[] {
       const message = request as { method?: string; params?: { threadId?: string } } | null;
@@ -426,6 +521,6 @@ export function createBackgroundTaskTracker(options: {
       if (/^(thread\/resume|turn\/start)$/.test(message.method ?? '')) return reconcilePersisted(message.params.threadId);
       return [];
     },
-    dispose() { disposed = true; threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
+    dispose() { disposed = true; threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
   };
 }
