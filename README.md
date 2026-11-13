@@ -64,7 +64,29 @@ Sign in if needed:
 agy acp --login
 ```
 
-The executable must be on that machine's `PATH`. Restart BB after changing `PATH`. Remote agent hosts need their own CLI installation and sign-in.
+The plugin checks `PATH`, then the standard CLI installer location on the agent host (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows or `~/.local/bin/agy` on macOS/Linux). Remote agent hosts need their own CLI installation and sign-in.
+
+If PowerShell reports **`agy` is not recognized**, check the default installation:
+
+```powershell
+Test-Path "$env:LOCALAPPDATA\agy\bin\agy.exe"
+```
+
+If it returns `False`, install the standalone CLI using the [official installation instructions](https://antigravity.google/docs/getting-started?tab=cli):
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex
+```
+
+If it returns `True`, add its directory to the current terminal's PATH and verify:
+
+```powershell
+$env:Path += ";$env:LOCALAPPDATA\agy\bin"
+agy --version
+agy acp --login
+```
+
+For future terminals, add `%LOCALAPPDATA%\agy\bin` to your user **Path** in Windows Environment Variables, then reopen PowerShell and restart BB. The plugin fallback also works without this PATH change.
 
 ### 2. Install the plugin
 
@@ -149,7 +171,7 @@ Automatic CLI installation, conversation forking, manual compaction, and native 
 | Problem | What to check |
 | --- | --- |
 | Antigravity is missing | Enable the installed plugin and its **Enable Antigravity CLI** setting. |
-| `agy` cannot be found | Install the CLI on the agent host, check `PATH`, and restart BB. |
+| `agy` cannot be found | Follow the PowerShell recovery steps above. Install the standalone CLI on the agent host; the plugin also checks its standard install location. |
 | Sign-in is required or expired | Run `agy acp --login` on the agent host, then retry. |
 | ACP is unavailable | Update the CLI and confirm `agy acp --help` works. |
 | Model list is empty | Check CLI sign-in, connectivity, and account eligibility, then refresh providers. |

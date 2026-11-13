@@ -6,6 +6,7 @@ import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
 import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
+import { resolveAntigravityLaunchSpec } from "./cli.ts";
 
 registerAntigravityAcpDialect();
 
@@ -155,6 +156,8 @@ export const experimental_providerBridge = {
     ensureStdoutFilter();
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { parsed = null; }
+    resolveAntigravityLaunchSpec(parsed);
+    if (parsed !== null) line = JSON.stringify(parsed);
     const withDefaults = applyAntigravityDefaults(line, parsed);
     const subagentTransformed = transformSubagentRequest(withDefaults.line, withDefaults.parsed);
     rememberApprovalSetting(subagentTransformed.parsed);
