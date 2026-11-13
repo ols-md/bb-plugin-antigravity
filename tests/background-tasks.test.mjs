@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText } from '../background-tasks.ts';
 
 const command = (id = 'conv/task-1', extra = {}) => ({ toolCallId: `call:${id}`, title: 'run_command', status: 'completed', content: [{ type: 'text', text: `Tool is running as a background task with task id: ${id}\nTask Description: build\n` }], ...extra });
@@ -239,4 +239,104 @@ test('stream completion buffers span chunks, remain isolated, and flush at text 
     tr.handleToolEventForThread('a', command(field));
     assert.equal(stdout(tr, 'a', { [field]: `Task id "${field}" failed` }).at(-1).status, 'failed');
   }
+});
+
+const statePath = t => { const dir = mkdtempSync(join(tmpdir(), 'background-state-')); t.after(() => rmSync(dir, { recursive: true, force: true })); return join(dir, 'background-tasks.json'); };
+
+test('registration persists a versioned record and settling removes it', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path });
+  const [open] = tr.handleToolEventForThread('thread', command('task-42'));
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  assert.equal(file.version, 1);
+  assert.equal(file.tasks.length, 1);
+  const [record] = file.tasks;
+  assert.equal(record.threadId, 'thread'); assert.equal(record.taskId, 'task-42'); assert.equal(record.taskType, 'local_bash');
+  assert.equal(record.description, 'build'); assert.equal(record.parentToolCallId, open.key.parentRef);
+  assert.ok(Number.isFinite(record.startedAt) && Math.abs(record.startedAt - Date.now()) < 60_000);
+  tr.handleToolEventForThread('thread', command('task-42')); // duplicate registration does not duplicate the record
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 1);
+  const [close] = tr.inspectTextForCompletions('thread', 'Task id "task-42" finished with result: success');
+  assert.equal(close.status, 'completed');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+});
+
+test('simulated host restart emits interrupted close deltas on resume and drops the records', t => {
+  const path = statePath(t);
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('thread', command('task-7'));
+  first.handleToolEventForThread('thread', agent('worker-1'));
+  first.handleToolEventForThread('other', command('untouched'));
+  first.dispose(); // Host death: in-memory state is lost, the file keeps the records.
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 3);
+  const restarted = tracker(t, { persistPath: path }); // Restarted plugin host.
+  const deltas = restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } });
+  assert.equal(deltas.length, 2);
+  for (const close of deltas) {
+    assert.equal(close.kind, 'item.close'); assert.equal(close.status, 'interrupted'); assert.equal(close.item.taskStatus, 'stopped');
+  }
+  assert.deepEqual(deltas.map(d => d.key.providerItemId).sort(), ['subagent:worker-1', 'task:task-7']);
+  assert.deepEqual(deltas.map(d => d.key.parentRef).sort(), ['call:task-7', 'call:worker-1']);
+  // Reconciled records drop, other threads' records survive untouched, and a second resume finds nothing.
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  assert.deepEqual(file.tasks.map(r => r.threadId), ['other']);
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'turn/start', params: { threadId: 'thread' } }), []);
+  assert.equal(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'other' } })[0].key.providerItemId, 'task:untouched');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+});
+
+test('resume and turn/start leave tasks that are still tracked in memory alone', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path });
+  tr.handleToolEventForThread('t', command('live'));
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 1);
+  assert.deepEqual(tr.handleInboundRequest({ method: 'thread/resume', params: { threadId: 't' } }), []);
+  assert.deepEqual(tr.handleInboundRequest({ method: 'turn/start', params: { threadId: 't' } }), []);
+  tr.inspectTextForCompletions('t', 'Task id "live" finished with result: done');
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+  tr.dispose();
+  const restarted = tracker(t, { persistPath: path });
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 't' } }), []);
+});
+
+test('corrupt, truncated, or invalid state files degrade to empty state and get repaired', t => {
+  const path = statePath(t);
+  mkdirSync(dirname(path), { recursive: true });
+  for (const corrupt of ['noise{{{', JSON.stringify({ version: 1, tasks: 'nope' }), JSON.stringify({ version: 2, tasks: [] }),
+    JSON.stringify({ version: 1, tasks: [{ threadId: 't' }, null, 42] }), '']) {
+    writeFileSync(path, corrupt);
+    const tr = tracker(t, { persistPath: path }); // must not throw and must treat the file as empty
+    assert.deepEqual(tr.handleInboundRequest({ method: 'thread/resume', params: { threadId: 't' } }), []);
+    tr.handleToolEventForThread('t', command('ok')); // registration still works and rewrites a valid file
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(file.version, 1); assert.equal(file.tasks.length, 1); assert.equal(file.tasks[0].taskId, 'ok');
+    tr.clearThread('t');
+  }
+});
+
+test('stale persisted records are garbage-collected on startup and cannot reconcile', t => {
+  const path = statePath(t);
+  mkdirSync(dirname(path), { recursive: true });
+  const record = (threadId, taskId, startedAt) => ({ threadId, taskId, taskType: 'local_bash', description: 'build', parentToolCallId: `call:${taskId}`, startedAt });
+  writeFileSync(path, JSON.stringify({ version: 1, tasks: [
+    record('stale', 'task-old', Date.now() - 10 * 24 * 60 * 60 * 1000), // 10 days, beyond the default max age
+    record('fresh', 'task-new', Date.now() - 60_000),
+  ] }));
+  const tr = tracker(t, { persistPath: path }); // Startup load prunes the stale record already.
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(r => r.threadId), ['fresh']);
+  assert.deepEqual(tr.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'stale' } }), []);
+  const [close] = tr.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'fresh' } });
+  assert.equal(close.key.providerItemId, 'task:task-new'); assert.equal(close.status, 'interrupted');
+});
+
+test('stale-record max age is configurable via taskStateMaxAgeMs', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path, taskStateMaxAgeMs: 0 }); // Every record is immediately stale.
+  tr.handleToolEventForThread('t', command('fleeting'));
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 1); // Live tasks still persist their record.
+  tr.dispose();
+  const restarted = tracker(t, { persistPath: path, taskStateMaxAgeMs: 0 });
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 't' } }), []);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
 });
