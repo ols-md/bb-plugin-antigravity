@@ -1,6 +1,6 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import { threadStartParamsSchema, threadResumeParamsSchema, turnStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";
-import { createBackgroundTaskTracker } from "./background-tasks.ts";
+import { createBackgroundTaskTracker, defaultBackgroundTaskStatePath } from "./background-tasks.ts";
 import { ANTIGRAVITY_ACP_DIALECT_ID, applyThreadCommandDescriptions, onToolUpdate, registerAntigravityAcpDialect } from "./dialect.ts";
 import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
@@ -12,6 +12,7 @@ registerAntigravityAcpDialect();
 
 let rawStdoutWrite: typeof process.stdout.write | null = null;
 export const backgroundTaskTracker = createBackgroundTaskTracker({
+  persistPath: defaultBackgroundTaskStatePath(),
   onAsyncDeltas(threadId, deltas) {
     if (!deltas.length) return;
     const write = rawStdoutWrite ?? process.stdout.write.bind(process.stdout);
