@@ -240,3 +240,71 @@ test('stream completion buffers span chunks, remain isolated, and flush at text 
     assert.equal(stdout(tr, 'a', { [field]: `Task id "${field}" failed` }).at(-1).status, 'failed');
   }
 });
+
+// Silent turn detection: a turn that ends with a failed command with empty output and no
+// agent text at all is surfaced with a synthetic agent-visible message (issue #16).
+const failedEmptyCommand = (extra = {}) => ({ kind: 'item.close', status: 'failed', key: { providerItemId: 'call:failed-cmd' }, item: { type: 'command', command: 'rebuild', cwd: '' }, exitCode: 1, ...extra });
+const boundary = (status = 'completed') => ({ kind: 'turn.boundary', status });
+const visibleAgentText = text => ({ kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text });
+const injectedMessage = deltas => deltas.find(d => d.kind === 'item.textClose');
+test('failed empty-output command with no agent text injects a visible message before the boundary', t => {
+  const tr = tracker(t);
+  const deltas = stdout(tr, 't', failedEmptyCommand(), boundary());
+  assert.deepEqual(deltas.map(d => d.kind), ['item.close', 'item.textDelta', 'item.textClose', 'turn.boundary']);
+  const open = deltas[1];
+  const message = injectedMessage(deltas);
+  assert.equal(open.channel, 'agentMessage'); assert.deepEqual(open.key, { channel: 'assistant' });
+  assert.equal(open.text, message.text); assert.equal(message.channel, 'agentMessage');
+  assert.match(message.text, /ended this turn without a response/);
+  assert.match(message.text, /reload|restart/i);
+});
+test('no injection for turns without empty-output failures or with agent text', t => {
+  const tr = tracker(t);
+  assert.deepEqual(stdout(tr, 't', boundary()), [boundary()]);
+  const noisyFailure = failedEmptyCommand({ aggregatedOutput: 'permission denied', resultText: 'permission denied' });
+  assert.deepEqual(stdout(tr, 't', noisyFailure, boundary()), [noisyFailure, boundary()]);
+  const completed = { ...failedEmptyCommand(), status: 'completed', exitCode: 0 };
+  assert.deepEqual(stdout(tr, 't', completed, boundary()), [completed, boundary()]);
+  const textTurn = [failedEmptyCommand(), visibleAgentText('I hit an error'), boundary()];
+  assert.deepEqual(stdout(tr, 't', ...textTurn), textTurn);
+  // reasoning-only text is not visible agent output, so it is still a silent give-up
+  const thinking = { kind: 'item.textDelta', key: { channel: 'thought' }, channel: 'reasoningText', text: 'thinking only' };
+  const injected = injectedMessage(stdout(tr, 't', failedEmptyCommand(), thinking, boundary()));
+  assert.ok(injected); assert.match(injected.text, /without a response/);
+});
+test('escalation after consecutive silent turns and reset on healthy turns', t => {
+  const tr = tracker(t);
+  const first = injectedMessage(stdout(tr, 't', failedEmptyCommand(), boundary()));
+  assert.match(first.text, /without a response|reload|restart/i);
+  assert.doesNotMatch(first.text, /broken in this session/);
+  const second = injectedMessage(stdout(tr, 't', failedEmptyCommand(), boundary()));
+  assert.match(second.text, /broken in this session/);
+  assert.match(second.text, /restart the thread runtime/i);
+  const third = injectedMessage(stdout(tr, 't', failedEmptyCommand(), boundary()));
+  assert.match(third.text, /3 consecutive turns/);
+  // a turn with a healthy command (no failure) resets the streak
+  assert.equal(stdout(tr, 't', boundary()).length, 1);
+  const afterReset = injectedMessage(stdout(tr, 't', failedEmptyCommand(), boundary()));
+  assert.doesNotMatch(afterReset.text, /broken in this session/);
+});
+test('interrupted boundaries are never injected and leave the streak intact', t => {
+  const tr = tracker(t);
+  assert.deepEqual(stdout(tr, 't', failedEmptyCommand(), boundary('interrupted')), [failedEmptyCommand(), boundary('interrupted')]);
+  const next = injectedMessage(stdout(tr, 't', failedEmptyCommand(), boundary()));
+  assert.doesNotMatch(next.text, /broken in this session/);
+});
+test('recorded failed run_command events with empty output also count as the silent signature', t => {
+  const tr = tracker(t);
+  tr.recordToolEvent({ toolCallId: 'call:empty', title: 'run_command', status: 'failed', content: [{ type: 'text', text: '   ' }] });
+  assert.equal(stdout(tr, 't', { kind: 'item.close', key: { providerItemId: 'call:empty' } }).length, 1);
+  const message = injectedMessage(stdout(tr, 't', boundary()));
+  assert.ok(message); assert.match(message.text, /without a response/);
+});
+test('silent-turn tracking is isolated per thread', t => {
+  const tr = tracker(t);
+  stdout(tr, 'a', failedEmptyCommand(), boundary());
+  const bFirst = injectedMessage(stdout(tr, 'b', failedEmptyCommand(), boundary()));
+  assert.doesNotMatch(bFirst.text, /broken in this session/);
+  const aSecond = injectedMessage(stdout(tr, 'a', failedEmptyCommand(), boundary()));
+  assert.match(aSecond.text, /broken in this session/);
+});
