@@ -791,6 +791,63 @@ test('parseAntigravityCommandOutput extracts exit code with optional period', ()
   assert.equal(parsed.cleanOutput, 'failed');
 });
 
+test('parseAntigravityCommandOutput preserves sandbox error diagnostics', () => {
+  // Sandbox error header with an empty output section: the diagnostic must
+  // become the cleaned output instead of being stripped down to an empty string.
+  const rawEmpty = `Created At: 2026-11-09T00:39:55+02:00
+There were sandbox errors: Access is denied (os error 5)
+Command exited with code 1.
+
+Command output:
+`;
+  const parsedEmpty = parseAntigravityCommandOutput(rawEmpty);
+  assert.equal(parsedEmpty.exitCode, 1);
+  assert.equal(parsedEmpty.cleanOutput, 'There were sandbox errors: Access is denied (os error 5)');
+
+  // Sandbox error header with a non-empty output section: the diagnostic is
+  // prepended to the output.
+  const rawWithOutput = `There were sandbox errors: writing to /workspace/project requires approval
+Command exited with code 1.
+
+Command output:
+partial output before denial
+`;
+  const parsedWithOutput = parseAntigravityCommandOutput(rawWithOutput);
+  assert.equal(parsedWithOutput.exitCode, 1);
+  assert.equal(
+    parsedWithOutput.cleanOutput,
+    'There were sandbox errors: writing to /workspace/project requires approval\npartial output before denial\n'
+  );
+
+  // Non-zero exit code with no output and no diagnostic headers: normalize to
+  // the exit-code line instead of an empty string.
+  const parsedExitOnly = parseAntigravityCommandOutput('The command exited with code 1.');
+  assert.equal(parsedExitOnly.exitCode, 1);
+  assert.equal(parsedExitOnly.cleanOutput, 'The command exited with code 1.');
+
+  // Cosmetic headers are still stripped: a successful command with an empty
+  // output section still normalizes to an empty string.
+  const rawSuccess = 'Created At: 2026-11-09T00:00:00+00:00\nCommand exited with code 0.\n\nCommand output:\n';
+  const parsedSuccess = parseAntigravityCommandOutput(rawSuccess);
+  assert.equal(parsedSuccess.exitCode, 0);
+  assert.equal(parsedSuccess.cleanOutput, '');
+});
+
+test('normalizeCommandEvent keeps diagnostic output for sandbox-denied commands', () => {
+  const event = {
+    toolCallId: 'norm_sandbox',
+    sessionUpdate: 'tool_call',
+    rawInput: { command: 'npm run build' },
+    rawOutput: `There were sandbox errors: Access is denied (os error 5)
+Command exited with code 1.
+
+Command output:
+`,
+  };
+  const normalized = normalizeCommandEvent(event);
+  assert.equal(normalized.rawOutput, 'There were sandbox errors: Access is denied (os error 5)');
+});
+
 test('onToolUpdate notifies when a second completed update arrives with new output text', () => {
   const delivered = [];
   const unsubscribe = onToolUpdate(event => {
