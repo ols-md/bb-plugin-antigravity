@@ -1,7 +1,8 @@
-import { experimental_execHostFile, experimental_hostToolchain } from "@get-bb/plugin-sdk/process";
+import { experimental_execHostFile } from "@get-bb/plugin-sdk/process";
 import type { ProviderUsageResult } from "@get-bb/plugin-sdk/provider-bridge";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { resolveAntigravityCommand } from "./cli.ts";
 
 const USAGE_TIMEOUT_MS = 15_000;
 const USAGE_CACHE_TTL_MS = 60_000;
@@ -203,15 +204,16 @@ export async function readAntigravityProviderUsage(options?: {
   const command = options?.command ?? "agy";
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
-  const resolveCommand = options?.resolveCommand ?? ((cmd, opts) => experimental_hostToolchain.resolve(cmd, opts));
+  const resolveCommand = options?.resolveCommand ?? resolveAntigravityCommand;
   const execFile = options?.execFile ?? experimental_execHostFile;
 
   try {
-    if (!command || await resolveCommand(command, { cwd, env }) === null) {
+    const resolvedCommand = command ? await resolveCommand(command, { cwd, env }) : null;
+    if (!resolvedCommand) {
       return { supported: true, usage: { status: "not_installed" } };
     }
     const { stdout, stderr } = await execFile(
-      command,
+      resolvedCommand,
       ["-p", "/usage", "--output-format", "json"],
       {
         cwd,
