@@ -22,6 +22,12 @@ export interface BackgroundTask {
   transcriptPath?: string;
   /** Epoch ms when the task was registered; internal, used only for the persisted state file. */
   startedAt?: number;
+  /** `run_command` with `IsDaemon: true` or a `schedule`: long-lived by design, so it never holds a turn open. */
+  daemon?: boolean;
+  /** Synthetic task for a `run_command` call the CLI left running when its prompt ended. */
+  orphan?: boolean;
+  /** Set once a hold has already waited on this task, so a task whose completion is never seen cannot stall later turns. */
+  holdExempt?: boolean;
 }
 /** Durable record persisted for each registered background task so state survives host restarts. */
 export interface PersistedBackgroundTask {
@@ -52,6 +58,17 @@ export interface SilentTurnInjectionDelta {
   channel: 'agentMessage';
   text: string;
 }
+export interface TurnBoundaryDelta {
+  kind: 'turn.boundary';
+  status?: string;
+  [field: string]: unknown;
+}
+export type TrackerDelta = BackgroundTaskDelta | SilentTurnInjectionDelta | TurnBoundaryDelta;
+/** Default wait for the CLI's reactive follow-up turn after every blocking task settled. */
+export const DEFAULT_HOLD_SETTLE_GRACE_MS = 20_000;
+/** Default upper bound on how long one turn can be held open for background work. */
+export const DEFAULT_MAX_TURN_HOLD_MS = 30 * 60 * 1000;
+const TERMINAL_TOOL_STATUS = /^(?:completed|failed|cancell?ed)$/;
 // After this many consecutive silent turns (failed empty-output command, no agent text),
 // the injected message escalates to "command execution appears broken in this session".
 export const SILENT_TURN_ESCALATION_THRESHOLD = 2;
@@ -165,10 +182,16 @@ function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean
 
 export function createBackgroundTaskTracker(options: {
   pollIntervalMs?: number;
-  onAsyncDeltas?: (threadId: string, deltas: BackgroundTaskDelta[]) => void;
+  onAsyncDeltas?: (threadId: string, deltas: TrackerDelta[]) => void;
   /** Path of the persisted state file; omit to keep tracking in memory only (used by tests and the dev harness). */
   persistPath?: string;
   taskStateMaxAgeMs?: number;
+  /** Hold a completed turn open while non-daemon background work it started is still running (default true). */
+  holdTurns?: boolean;
+  /** How long to wait for the CLI's reactive follow-up turn once every blocking task settled. */
+  holdSettleGraceMs?: number;
+  /** Safety cap on a single hold; the held boundary is released when it expires. */
+  maxTurnHoldMs?: number;
 } = {}) {
   const threads = new Map<string, Map<string, BackgroundTask>>();
   const pending = new Map<string, RecordedToolEvent[]>();
@@ -302,7 +325,7 @@ export function createBackgroundTaskTracker(options: {
     }
     if (!tasks?.size) threads.delete(thread);
     syncPolling();
-    if (results.length) { touchedThreads.add(thread); persistState(); }
+    if (results.length) { touchedThreads.add(thread); persistState(); armSettleGrace(thread); }
     return results;
   }
   function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
@@ -391,6 +414,8 @@ export function createBackgroundTaskTracker(options: {
     }
     const agent = name === 'invoke_subagent';
     const raw = event.rawOutput as Record<string, unknown> | undefined;
+    // Daemons and schedules (timers, recurring cron jobs) are meant to outlive the turn.
+    const daemon = !agent && (name === 'schedule' || input.IsDaemon === true || input.IsDaemon === 'true');
     const spawnedId = /\bSubagent spawned\b/i.test(text) ? /\bconversationId:[ \t]*([^\s,]+)/i.exec(text)?.[1] : undefined;
     const id = agent ? first(raw?.conversationId, /"conversationId"\s*:\s*"([^"]+)"/.exec(text)?.[1], spawnedId)
       : /^(run_command|schedule)$/.test(name) ? first(/Tool is running as a background task with task id:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1], /Background command ID:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1]) : '';
@@ -399,9 +424,13 @@ export function createBackgroundTaskTracker(options: {
     const outputFile = first(/Task logs are available at:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1]);
     const task: BackgroundTask = { taskId: id, taskType: agent ? 'local_subagent' : 'local_bash', parentToolCallId: event.toolCallId,
       description: agent ? first(input.Role, input.TypeName, title, id) : first(input.toolSummary, /Task Description:[ \t]*([^\s\r\n][^\r\n]*)/.exec(text)?.[1], input.CommandLine, input.command, input.Prompt, title, id),
-      ...(outputFile ? { outputFile: normalizeFileUri(outputFile), transcriptPath: deriveTranscriptPathFromLogFile(outputFile) ?? undefined } : {}), startedAt: Date.now() };
+      ...(outputFile ? { outputFile: normalizeFileUri(outputFile), transcriptPath: deriveTranscriptPathFromLogFile(outputFile) ?? undefined } : {}), startedAt: Date.now(),
+      ...(daemon ? { daemon } : {}) };
+    return [...results, ...registerTask(thread, task)];
+  }
+  function registerTask(thread: string, task: BackgroundTask): BackgroundTaskDelta[] {
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
-    if (tasks.has(taskKey(task))) return results;
+    if (tasks.has(taskKey(task))) return [];
     tasks.set(taskKey(task), task); threads.set(thread, tasks);
     touchedThreads.add(thread); persistState();
     if (task.transcriptPath && interval > 0) {
@@ -414,13 +443,210 @@ export function createBackgroundTaskTracker(options: {
       watchers.set(thread, paths);
       if (!timer) { timer = setInterval(poll, interval); timer.unref(); }
     }
-    return [...results, delta(task)];
+    return [delta(task)];
+  }
+  /**
+   * The CLI can end its prompt while a `run_command` call is still `in_progress`. The SDK bridge
+   * then force-closes the item (status `completed`, no output, no `noTurnFallback`) although the
+   * command keeps running, and the real result only arrives as a `tool_call_update` after the
+   * turn boundary. Track such a call as a background task so the turn can be held and the late
+   * result settles it.
+   */
+  function registerOrphanCommand(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+    const name = inferAntigravityToolName(event as any) ?? [event.title, event.kind].find(v => v === 'run_command');
+    if (name !== 'run_command') return [];
+    const input = event.rawInput ?? {};
+    return registerTask(thread, {
+      taskId: event.toolCallId, taskType: 'local_bash', parentToolCallId: event.toolCallId,
+      description: first(input.toolSummary, input.CommandLine, input.command, event.title, event.toolCallId),
+      startedAt: Date.now(), orphan: true,
+      ...(input.IsDaemon === true || input.IsDaemon === 'true' ? { daemon: true } : {}),
+    });
+  }
+  function settleOrphanCommand(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+    const task = threads.get(thread)?.get(taskKey({ taskType: 'local_bash', taskId: event.toolCallId }));
+    if (!task?.orphan || !TERMINAL_TOOL_STATUS.test(event.status ?? '')) return [];
+    const text = extractToolOutputText(event).trim();
+    const failed = event.status === 'failed' || /(?:The c|C)ommand exited with code [1-9]\d*/.test(text);
+    const killed = !failed && /cancel/i.test(event.status ?? '');
+    return settle(thread, task.taskId, failed ? 'failed' : killed ? 'interrupted' : 'completed',
+      failed ? 'failed' : killed ? 'killed' : 'completed', text || undefined, 'local_bash');
+  }
+
+  // ---- Turn hold ----------------------------------------------------------------------------
+  // The CLI detaches any command that outlives its 10 s synchronous wait and tells the model to
+  // stop calling tools until it is notified. The prompt then ends with `end_turn`, the bridge
+  // emits a completed `turn.boundary`, and BB marks the thread idle and notifies parent threads
+  // although the agent is only waiting. When the task exits, the CLI wakes the model with an
+  // unsolicited turn. So while blocking work runs, the completed boundary is held back; the
+  // reactive turn's `turn.open` is absorbed into the still-open BB turn, and the boundary that
+  // finally reaches BB is the one that ends the agent's real work.
+  interface TurnHold {
+    /** Held `turn.boundary`; present while BB's turn is kept open. */
+    boundary?: TurnBoundaryDelta;
+    /** A bridge turn (reactive wakeup or steer prompt) was absorbed into the held turn. */
+    bridgeTurnOpen: boolean;
+    /** BB's turn was closed while an absorbed bridge turn was still open; drop that turn's boundary. */
+    dropNextBoundary: boolean;
+    /** JSON-RPC id of a steer rewritten into turn/start, until the bridge answers it. */
+    steerRequestId?: string | number;
+    graceTimer?: ReturnType<typeof setTimeout>;
+    capTimer?: ReturnType<typeof setTimeout>;
+  }
+  const holds = new Map<string, TurnHold>();
+  const holdTurns = options.holdTurns !== false;
+  const settleGraceMs = Math.max(0, options.holdSettleGraceMs ?? DEFAULT_HOLD_SETTLE_GRACE_MS);
+  const maxHoldMs = Math.max(0, options.maxTurnHoldMs ?? DEFAULT_MAX_TURN_HOLD_MS);
+  /** Tasks whose end the tracker sees itself (transcript watcher or late tool update). */
+  function observable(thread: string, task: BackgroundTask): boolean {
+    return task.orphan === true || (!!task.transcriptPath && !!watchers.get(thread)?.has(task.transcriptPath));
+  }
+  function holdBlockers(thread: string): BackgroundTask[] {
+    return [...(threads.get(thread)?.values() ?? [])].filter(task => !task.daemon && !task.holdExempt);
+  }
+  function clearHoldTimers(hold: TurnHold) {
+    if (hold.graceTimer) clearTimeout(hold.graceTimer);
+    if (hold.capTimer) clearTimeout(hold.capTimer);
+    hold.graceTimer = undefined; hold.capTimer = undefined;
+  }
+  /** After a hold ends, never wait again on tasks it could not watch (or on anything, after the cap). */
+  function exemptAfterHold(thread: string, all: boolean) {
+    for (const task of threads.get(thread)?.values() ?? []) if (all || !observable(thread, task)) task.holdExempt = true;
+  }
+  function closeTurn(thread: string, boundary: TurnBoundaryDelta): TrackerDelta[] {
+    const injected = handleTurnBoundary(thread, boundary.status);
+    return [...(typeof injected === 'string' ? silentTurnInjection(injected) : []), boundary];
+  }
+  /** Ends an active hold and returns the deltas that close BB's turn ([] when nothing is held). */
+  function releaseHold(thread: string, status?: string, capped = false): TrackerDelta[] {
+    const hold = holds.get(thread);
+    if (!hold?.boundary) return [];
+    const boundary: TurnBoundaryDelta = { ...hold.boundary, ...(status ? { status } : {}) };
+    clearHoldTimers(hold);
+    hold.boundary = undefined;
+    hold.dropNextBoundary = hold.bridgeTurnOpen;
+    hold.bridgeTurnOpen = false;
+    if (!hold.dropNextBoundary) holds.delete(thread);
+    exemptAfterHold(thread, capped);
+    return closeTurn(thread, boundary);
+  }
+  function releaseHoldAsync(thread: string, capped: boolean) {
+    if (disposed) return;
+    const deltas = releaseHold(thread, undefined, capped);
+    if (deltas.length) options.onAsyncDeltas?.(thread, deltas);
+  }
+  function beginHold(thread: string, boundary: TurnBoundaryDelta) {
+    const hold: TurnHold = { boundary, bridgeTurnOpen: false, dropNextBoundary: false };
+    holds.set(thread, hold);
+    hold.capTimer = setTimeout(() => releaseHoldAsync(thread, true), maxHoldMs);
+    hold.capTimer.unref?.();
+  }
+  /**
+   * Every blocking task settled but no reactive turn has started: give the CLI a grace period to
+   * wake the model, then release the boundary (silent exit, missed wakeup, or a dead CLI).
+   */
+  function armSettleGrace(thread: string) {
+    const hold = holds.get(thread);
+    if (!hold?.boundary || hold.bridgeTurnOpen || hold.graceTimer || holdBlockers(thread).length) return;
+    hold.graceTimer = setTimeout(() => {
+      hold.graceTimer = undefined;
+      if (holds.get(thread) === hold && hold.boundary && !hold.bridgeTurnOpen && !holdBlockers(thread).length) releaseHoldAsync(thread, false);
+    }, settleGraceMs);
+    hold.graceTimer.unref?.();
+  }
+  /** Returns false when a bridge `turn.open` must be absorbed into the held BB turn. */
+  function routeTurnOpen(thread: string): boolean {
+    const hold = holds.get(thread);
+    if (hold?.boundary) {
+      hold.bridgeTurnOpen = true;
+      if (hold.graceTimer) { clearTimeout(hold.graceTimer); hold.graceTimer = undefined; }
+      return false;
+    }
+    // A new bridge turn supersedes one whose boundary was still owed after an early release.
+    if (hold?.dropNextBoundary) holds.delete(thread);
+    return true;
+  }
+  function routeTurnBoundary(thread: string, boundary: TurnBoundaryDelta): 'forward' | 'hold' | 'drop' {
+    const hold = holds.get(thread);
+    if (hold && !hold.boundary && hold.dropNextBoundary) { holds.delete(thread); return 'drop'; }
+    if (hold?.boundary) {
+      // After an absorbed turn, only keep waiting on work whose end is observable: a reactive
+      // wakeup is itself the CLI's notice that unobservable work finished.
+      if (hold.bridgeTurnOpen) exemptAfterHold(thread, false);
+      hold.bridgeTurnOpen = false;
+      if (boundary.status === 'completed' && holdBlockers(thread).length) {
+        hold.boundary = boundary;
+        return 'hold';
+      }
+      clearHoldTimers(hold); holds.delete(thread);
+      exemptAfterHold(thread, false);
+      return 'forward';
+    }
+    if (holdTurns && boundary.status === 'completed' && holdBlockers(thread).length) { beginHold(thread, boundary); return 'hold'; }
+    return 'forward';
+  }
+  /**
+   * Matches the bridge's answer to a steer that was rewritten into turn/start. A rejected prompt
+   * (for example the CLI session died while the turn was held) will never open a turn, so the
+   * held turn is released instead of waiting for the cap.
+   */
+  function steerResponse(message: any): { thread: string; failed: boolean } | null {
+    if (!message || message.method !== undefined || (typeof message.id !== 'string' && typeof message.id !== 'number')) return null;
+    for (const [thread, hold] of holds) {
+      if (hold.steerRequestId !== message.id) continue;
+      hold.steerRequestId = undefined;
+      const failed = message.error !== undefined && message.result === undefined;
+      if (failed) hold.bridgeTurnOpen = false;
+      return { thread, failed };
+    }
+    return null;
+  }
+  function deltaLines(thread: string, deltas: TrackerDelta[]): string[] {
+    return deltas.length ? [JSON.stringify({ jsonrpc: '2.0', method: 'thread/delta', params: { threadId: thread, deltas } })] : [];
+  }
+  /** Abandons hold state without emitting anything (the turn is settled some other way). */
+  function dropHold(thread: string) {
+    const hold = holds.get(thread);
+    if (hold) { clearHoldTimers(hold); holds.delete(thread); }
   }
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
     const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
+    if (holds.get(thread)?.boundary) dropHold(thread);
     threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
     touchedThreads.add(thread); persistState(); return results;
+  }
+  function handleInbound(request: unknown): { request: unknown; deltas: TrackerDelta[] } {
+    const message = request as { method?: string; params?: { threadId?: string } } | null;
+    if (!message || typeof message.params?.threadId !== 'string') return { request, deltas: [] };
+    const thread = message.params.threadId;
+    const method = message.method ?? '';
+    if (method === 'thread/stop' || method === 'thread/discard') {
+      // Stop never waits on a held turn: close it as interrupted. If the bridge still has an
+      // absorbed turn open, it emits its own interrupted boundary, which is then dropped.
+      const released = releaseHold(thread, 'interrupted');
+      if (method === 'thread/discard') holds.delete(thread);
+      return { request, deltas: [...clearThread(thread, true), ...released] };
+    }
+    const hold = holds.get(thread);
+    if (method === 'turn/steer' && hold?.boundary && !hold.bridgeTurnOpen) {
+      // BB still shows the held turn as running and steers it, but the bridge has no prompt to
+      // steer and would reject the input as a stale turn. Start a prompt instead; its turn.open
+      // is absorbed, so the input continues the same BB turn.
+      hold.bridgeTurnOpen = true;
+      const id = (message as { id?: unknown }).id;
+      if (typeof id === 'string' || typeof id === 'number') hold.steerRequestId = id;
+      if (hold.graceTimer) { clearTimeout(hold.graceTimer); hold.graceTimer = undefined; }
+      return { request: { ...message, method: 'turn/start' }, deltas: [] };
+    }
+    // Restart reconciliation hook: BB re-issues `thread/resume` (and a `turn/start` for the
+    // resumed turn) to every connected host, so this runs exactly once per resumed thread and
+    // before the CLI sees the resume. Cleaner than keying off processStdoutLine activity,
+    // which also arrives mid-turn for cases that are not resumes at all.
+    // A new turn while a turn is held closes the held one first, keeping turn state balanced.
+    if (method === 'turn/start') return { request, deltas: [...releaseHold(thread), ...reconcilePersisted(thread)] };
+    if (method === 'thread/resume') return { request, deltas: reconcilePersisted(thread) };
+    return { request, deltas: [] };
   }
   // Startup load: snapshot which records predate this host process (only those are eligible for
   // reconciliation) and flush a GC pass so records older than the max age cannot accumulate
@@ -443,6 +669,8 @@ export function createBackgroundTaskTracker(options: {
     processStdoutLine(line: string): string[] {
       let message;
       try { message = JSON.parse(line); } catch { return [line]; }
+      const response = steerResponse(message);
+      if (response) return response.failed ? [line, ...deltaLines(response.thread, releaseHold(response.thread))] : [line];
       const params = message?.params;
       if (message?.method !== 'thread/delta' || typeof params?.threadId !== 'string' || !Array.isArray(params.deltas)) return [line];
       const extra: BackgroundTaskDelta[] = [];
@@ -451,6 +679,7 @@ export function createBackgroundTaskTracker(options: {
       // so the outgoing deltas are rebuilt instead of blindly appended.
       const ordered: unknown[] = [];
       let boundarySeen = false;
+      let modified = false;
       for (const entry of params.deltas) {
         const update = entry?.noTurnFallback?.raw?.params?.update;
         const id = entry?.key?.providerItemId ?? update?.toolCallId;
@@ -460,15 +689,20 @@ export function createBackgroundTaskTracker(options: {
           if (!queue?.length) pending.delete(id);
           // The fallback update belongs to this exact thread; prefer it over the unscoped hook.
           const event = update && typeof update === 'object' ? { ...update, toolCallId: id } as RecordedToolEvent : queued;
-          if (event) {
-            const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
-            const merged = mergeToolEvent(tools.get(id), event);
-            tools.set(id, merged); threadTools.set(params.threadId, tools);
-            if (merged.status === 'completed' || merged.status === 'failed' || entry?.kind === 'item.close') {
-              extra.push(...handleToolEventForThread(params.threadId, merged));
-            }
+          const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
+          const known = tools.get(id);
+          const merged = event ? mergeToolEvent(known, event) : known;
+          if (event) { tools.set(id, merged!); threadTools.set(params.threadId, tools); }
+          if (merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? '')) {
+            // The bridge flushed a call the CLI never finished (prompt ended mid-command).
+            extra.push(...registerOrphanCommand(params.threadId, merged));
+          } else if (event && merged && (merged.status === 'completed' || merged.status === 'failed' || entry?.kind === 'item.close')) {
+            extra.push(...settleOrphanCommand(params.threadId, merged));
+            extra.push(...handleToolEventForThread(params.threadId, merged));
           }
         }
+        if (entry?.settlesTurn === true) dropHold(params.threadId); // e.g. provider.error: BB settles the turn itself.
+        if (entry?.kind === 'turn.open' && !routeTurnOpen(params.threadId)) { modified = true; continue; }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
           streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
           // Visible agent text (not reasoning) marks the turn as non-silent.
@@ -496,10 +730,15 @@ export function createBackgroundTaskTracker(options: {
             silentState(params.threadId).emptyFailedCommand = true;
           }
         }
-        if (entry?.kind === 'turn.boundary' && !boundarySeen) {
-          boundarySeen = true;
-          const injectedText = handleTurnBoundary(params.threadId, entry?.status);
-          if (typeof injectedText === 'string') ordered.push(...silentTurnInjection(injectedText));
+        if (entry?.kind === 'turn.boundary') {
+          // Held or dropped boundaries do not end the logical turn, so silent-turn state carries over.
+          const route = routeTurnBoundary(params.threadId, entry);
+          if (route !== 'forward') { modified = true; continue; }
+          if (!boundarySeen) {
+            boundarySeen = true;
+            const injectedText = handleTurnBoundary(params.threadId, entry?.status);
+            if (typeof injectedText === 'string') ordered.push(...silentTurnInjection(injectedText));
+          }
         }
         ordered.push(entry);
         for (const text of [entry?.resultText, entry?.aggregatedOutput, entry?.message, entry?.delta?.text, entry?.item?.output, entry?.item?.text]) {
@@ -507,20 +746,15 @@ export function createBackgroundTaskTracker(options: {
         }
       }
       ordered.push(...extra);
-      if (ordered.length === params.deltas.length) return [line];
+      if (!modified && ordered.length === params.deltas.length) return [line];
+      if (!ordered.length) return []; // Everything in the line was held or absorbed.
       params.deltas = ordered; return [JSON.stringify(message)];
     },
-    handleInboundRequest(request: unknown): BackgroundTaskDelta[] {
-      const message = request as { method?: string; params?: { threadId?: string } } | null;
-      if (!message || typeof message.params?.threadId !== 'string') return [];
-      if (/^(thread\/stop|thread\/discard)$/.test(message.method ?? '')) return clearThread(message.params.threadId, true);
-      // Restart reconciliation hook: BB re-issues `thread/resume` (and a `turn/start` for the
-      // resumed turn) to every connected host, so this runs exactly once per resumed thread and
-      // before the CLI sees the resume. Cleaner than keying off processStdoutLine activity,
-      // which also arrives mid-turn for cases that are not resumes at all.
-      if (/^(thread\/resume|turn\/start)$/.test(message.method ?? '')) return reconcilePersisted(message.params.threadId);
-      return [];
-    },
-    dispose() { disposed = true; threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
+    /** Routes an inbound bridge request; may rewrite it (steer into a held turn) and returns deltas to emit first. */
+    handleInbound,
+    handleInboundRequest(request: unknown): TrackerDelta[] { return handleInbound(request).deltas; },
+    /** Whether a completed boundary is currently held for the thread. */
+    isHoldingTurn(thread: string): boolean { return holds.get(thread)?.boundary !== undefined; },
+    dispose() { disposed = true; for (const hold of holds.values()) clearHoldTimers(hold); holds.clear(); threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
   };
 }

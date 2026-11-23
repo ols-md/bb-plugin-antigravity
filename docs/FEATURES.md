@@ -5,7 +5,7 @@ Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.109 on Windows. A terminal
 | Feature | Current integration |
 | --- | --- |
 | Streaming, tools, approvals | Shared BB ACP bridge + custom `antigravity` ACP dialect |
-| Background commands & agents | Live BB `backgroundTask` composer banner and sidebar indicator for backgrounded `run_command`, `schedule`, and `invoke_subagent` tasks, with settlement via `manage_task`, `manage_subagents`, completion notifications, and transcript tailing |
+| Background commands & agents | Live BB `backgroundTask` composer banner and sidebar indicator for backgrounded `run_command`, `schedule`, and `invoke_subagent` tasks, with settlement via `manage_task`, `manage_subagents`, completion notifications, and transcript tailing. A completed turn boundary is held while non-daemon background work is running and released after the CLI's reactive follow-up turn (with a grace period, a 30-minute cap, and immediate release on stop or a new turn) |
 | Subagent delegation control | Optional `subagentsDisabled` setting instructs agents to delegate via BB (`bb thread spawn --parent-self`) and blocks native subagent tool approvals |
 | Command & tool presentation | Displays `toolSummary` descriptions (`commandDescriptionsEnabled`), clean command output and exit codes, destructive **Outside of sandbox** badges (`BypassSandbox`), and native delegation cards |
 | Model and reasoning choices | Discovered from CLI; account dependent |

@@ -160,9 +160,15 @@ export const experimental_providerBridge = {
     resolveAntigravityLaunchSpec(parsed);
     if (parsed !== null) line = JSON.stringify(parsed);
     const withDefaults = applyAntigravityDefaults(line, parsed);
-    const subagentTransformed = transformSubagentRequest(withDefaults.line, withDefaults.parsed);
+    // Runs first: a steer into a held turn is rewritten to turn/start, which the transforms below
+    // must then treat like any other turn/start.
+    const inbound = backgroundTaskTracker.handleInbound(withDefaults.parsed);
+    const routed = inbound.request === withDefaults.parsed
+      ? withDefaults
+      : { line: JSON.stringify(inbound.request), parsed: inbound.request };
+    const subagentTransformed = transformSubagentRequest(routed.line, routed.parsed);
     rememberApprovalSetting(subagentTransformed.parsed);
-    const closeDeltas = backgroundTaskTracker.handleInboundRequest(subagentTransformed.parsed);
+    const closeDeltas = inbound.deltas;
     if (closeDeltas.length > 0) {
       const stopThreadId = (subagentTransformed.parsed as Record<string, any> | null)?.params?.threadId;
       if (typeof stopThreadId === "string") {

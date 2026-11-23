@@ -23,7 +23,7 @@ An experimental community provider that connects [BB](https://getbb.app) to the 
 - **Live model discovery:** models and reasoning options come from your CLI and account.
 - **Plan and Build:** plan a task, then switch back to implementation.
 - **Permission controls:** choose Accept edits or Full access.
-- **Background task & agent indicators:** see live composer and sidebar indicators when `run_command`, `schedule`, or native subagents run in the background.
+- **Background task & agent indicators:** see live composer and sidebar indicators when `run_command`, `schedule`, or native subagents run in the background. A turn stays running while the agent waits on non-daemon background work it started, so BB and parent threads are not told it finished early.
 - **BB agent delegation toggle:** optionally disable native Antigravity subagents so agents delegate work using BB threads (`bb thread spawn --parent-self`).
 - **Rich Antigravity tool cards:** view command summaries (`toolSummary`), clean command output with exit codes, destructive **Outside of sandbox** badges when `BypassSandbox` is used, and native subagent delegation cards.
 - **Native skills:** discover your workspace and personal Antigravity skills in BB.
