@@ -2,13 +2,27 @@ import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 import { experimental_hostToolchain } from "@get-bb/plugin-sdk/process";
-import { experimental_buildProviderCliEnv } from "@get-bb/plugin-sdk/provider-bridge";
+import { experimental_buildProviderCliEnv, experimental_compareVersions, experimental_versionFrom, type ProviderHealthResult } from "@get-bb/plugin-sdk/provider-bridge";
 
 function installerPath(env: NodeJS.ProcessEnv): string {
   if (process.platform !== "win32") return join(homedir(), ".local", "bin", "agy");
   const localAppData = env[Object.keys(env).find(key => key.toUpperCase() === "LOCALAPPDATA") ?? "LOCALAPPDATA"];
   const root = localAppData && isAbsolute(localAppData) ? localAppData : join(homedir(), "AppData", "Local");
   return join(root, "agy", "bin", "agy.exe");
+}
+
+const MIN_AGY_ACP_VERSION = "1.5.0";
+
+export function addAntigravityHealthDiagnostic(result: ProviderHealthResult | undefined): void {
+  if (result?.supported !== true || result.health?.status !== "ready") return;
+  const health = result.health;
+  const version = health.installedVersion;
+  if (typeof version !== "string" || experimental_versionFrom(version) !== version ||
+      experimental_compareVersions(version, MIN_AGY_ACP_VERSION) >= 0) return;
+
+  health.status = "unsupported_version";
+  health.minimumSupportedVersion = MIN_AGY_ACP_VERSION;
+  health.statusMessage = `Antigravity CLI ${version} is installed on the agent host. BB needs version ${MIN_AGY_ACP_VERSION} or later for ACP. Run \`agy update\` on that host, then check provider health again.`;
 }
 
 export function resolveAntigravityCommand(command: string, options?: { cwd?: string; env?: NodeJS.ProcessEnv }): string | null {

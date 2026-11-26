@@ -2,6 +2,8 @@
 
 Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.109 on Windows. A terminal CLI feature does not imply that the same feature is exposed through ACP.
 
+The contributor in issue #29 reported tests on Unraid with Node.js 26 and Antigravity CLI 1.5.14. The tests used real BB threads and covered the fork's ACP proxy, conversation forking, and compaction. Live Linux validation on this plugin's main branch remains open. [Contributor's test report](https://github.com/mturilin/bb-plugin-antigravity/commit/3323a3a40445e58d62a70a24ca242e4e3fdcfd4c)
+
 | Feature | Current integration |
 | --- | --- |
 | Streaming, tools, approvals | Shared BB ACP bridge + custom `antigravity` ACP dialect |
