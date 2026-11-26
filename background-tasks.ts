@@ -154,25 +154,114 @@ function boundText(text: string, maxChars: number): string {
   return `${sliceHeadSafe(text, head)}${TRUNCATION_MARKER}${sliceTailSafe(text, tail)}`;
 }
 
-function unescapeOversizedText(raw: string): string {
-  return raw
-    .replace(/\\(["nrt\\])/g, (_, ch: string) => ch === 'n' ? '\n' : ch === 'r' ? '\r' : ch === 't' ? '\t' : ch)
-    .replace(/\\"/g, '"');
+// "message" also appears in legacy transcript records.
+const TRANSCRIPT_TEXT_KEYS = new Set(['text', 'content', 'output', 'message']);
+const JSON_ARRAY_START = /^(?:["{\[\]]|(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+-]?\d*)?|-)(?=[ \t\r,\]]|$))/;
+
+function extractTranscriptText(value: unknown): string {
+  const strings: string[] = [];
+  const pending = [value];
+  while (pending.length) {
+    const part = pending.pop();
+    if (typeof part === 'string') {
+      if (part) strings.push(part);
+    } else if (Array.isArray(part)) {
+      for (let i = part.length - 1; i >= 0; i -= 1) pending.push(part[i]);
+    } else if (part && typeof part === 'object') {
+      for (const [key, entry] of Object.entries(part).reverse()) {
+        if (TRANSCRIPT_TEXT_KEYS.has(key)) pending.push(entry);
+      }
+    }
+  }
+  return strings.join('\n');
 }
 
-function unescapeIncremental(carry: string, raw: string, flush: boolean): { text: string; carry: string } {
-  const input = carry ? carry + raw : raw;
-  if (!input) return { text: '', carry: '' };
-  if (flush) return { text: unescapeOversizedText(input), carry: '' };
-  let trailing = 0;
-  for (let i = input.length - 1; i >= 0 && input.charCodeAt(i) === 0x5c /* '\' */; i -= 1) trailing += 1;
-  if (trailing === 0) return { text: unescapeOversizedText(input), carry: '' };
-  const hold = trailing <= 3 ? trailing : trailing % 2;
-  if (hold === 0) return { text: unescapeOversizedText(input), carry: '' };
-  return {
-    text: unescapeOversizedText(input.slice(0, input.length - hold)),
-    carry: input.slice(input.length - hold),
-  };
+interface TranscriptJsonState {
+  frames: { object: boolean; expectKey: boolean; selectValue: boolean }[];
+  skipDepth: number;
+  string?: 'key' | 'text-start' | 'text' | 'skip';
+  key: string;
+  escape: string;
+  hasText: boolean;
+  done: boolean;
+  invalid: boolean;
+}
+
+function readTranscriptJson(state: TranscriptJsonState, raw: string, maxDepth: number): string {
+  const input = state.escape + raw;
+  state.escape = '';
+  const stringToken = /[^"\\\x00-\x1f]+|\\(?:["\\/bfnrt]|u[\da-fA-F]{4})|"/y;
+  const unselectedToken = /[^"[\]{},]+/y;
+  let text = '';
+  let pos = 0;
+  while (pos < input.length && !state.invalid && !state.done) {
+    const frame = state.frames.at(-1);
+    const ch = input[pos];
+    if (state.string) {
+      stringToken.lastIndex = pos;
+      const token = stringToken.exec(input)?.[0];
+      if (!token) {
+        if (ch === '\\' && input.length - pos < 6) state.escape = input.slice(pos);
+        else state.invalid = true;
+        break;
+      }
+      pos = stringToken.lastIndex;
+      if (token === '"') {
+        if (state.string === 'key' && frame) frame.selectValue = TRANSCRIPT_TEXT_KEYS.has(state.key);
+        if (!frame && !state.skipDepth) state.done = true;
+        state.string = undefined;
+      } else if (state.string !== 'skip') {
+        const decoded: string = ch === '\\' ? JSON.parse('"' + token + '"') : token;
+        if (state.string === 'key') {
+          // The longest selectable key is "content".
+          if (state.key.length + decoded.length <= 7) state.key += decoded;
+          else state.string = 'skip';
+        } else {
+          if (state.string === 'text-start' && state.hasText) text += '\n';
+          text += decoded;
+          state.string = 'text';
+          state.hasText = true;
+        }
+      }
+      continue;
+    }
+
+    const selected = !state.skipDepth && (!frame || frame.selectValue);
+    pos += 1;
+    if (ch === '"') {
+      if (!state.skipDepth && frame?.expectKey) {
+        frame.expectKey = false;
+        frame.selectValue = false;
+        state.key = '';
+        state.string = 'key';
+      } else {
+        state.string = selected ? 'text-start' : 'skip';
+      }
+    } else if (ch === '{' || ch === '[') {
+      // Track ignored subtrees by depth alone, including metadata nested inside message text.
+      if (!selected || state.frames.length >= maxDepth) {
+        state.skipDepth += 1;
+      } else {
+        const object = ch === '{';
+        state.frames.push({ object, expectKey: object, selectValue: !object });
+      }
+    } else if (ch === '}' || ch === ']') {
+      if (state.skipDepth) state.skipDepth -= 1;
+      else if (frame?.object === (ch === '}')) state.frames.pop();
+      else state.invalid = true;
+      if (!state.frames.length && !state.skipDepth) state.done = true;
+    } else if (ch === ',') {
+      if (!state.skipDepth && frame?.object) {
+        frame.expectKey = true;
+        frame.selectValue = false;
+      }
+    } else {
+      unselectedToken.lastIndex = pos - 1;
+      unselectedToken.exec(input);
+      pos = unselectedToken.lastIndex;
+    }
+  }
+  return text;
 }
 
 function compactRawInput(rawInput: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -482,9 +571,7 @@ export function createBackgroundTaskTracker(options: {
     plainScan?: StreamingScanState;
     offset: number;
     partial: string;
-    oversizedLine: boolean;
-    oversizedBackslash: string;
-    oversizedScan?: StreamingScanState;
+    oversized?: { prefix: string; kind?: 'json' | 'plain'; json?: TranscriptJsonState; scan?: StreamingScanState };
     decoder: StringDecoder;
   }
   const threads = new Map<string, Map<string, BackgroundTask>>();
@@ -582,7 +669,7 @@ export function createBackgroundTaskTracker(options: {
     taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
     ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
   }, 'interrupted', 'stopped');
-  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean; delayed: boolean }>();
+  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean; delayed: boolean; predecessorToolCallId?: string }>();
   const pendingReconciliations = new Set<string>();
   const localTouchedBeforeStartupLoad = new Set<string>();
   const clearedBeforeStartupLoad = new Set<string>();
@@ -652,13 +739,24 @@ export function createBackgroundTaskTracker(options: {
     clearedBeforeStartupLoad.clear();
   }
   function applyPendingWrites(loadedTasks: PersistedBackgroundTask[]): PersistedBackgroundTask[] {
-    const records = new Map(loadedTasks.map(record => [recordKey(record), record]));
+    const persisted = new Map(loadedTasks.map(record => [recordKey(record), record]));
+    const records = new Map(persisted);
     for (const change of pendingWrites.values()) {
       const key = recordKey(change.record);
       const existing = records.get(key);
       if (change.remove) {
         if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
-      } else if (!existing || (change.delayed ? existing.startedAt < change.record.startedAt : existing.startedAt <= change.record.startedAt)) {
+        continue;
+      }
+      const onDisk = persisted.get(key);
+      const sameTimestamp = onDisk?.startedAt === change.record.startedAt;
+      const samePredecessor = sameTimestamp && onDisk.parentToolCallId === change.predecessorToolCallId;
+      if (onDisk && change.predecessorToolCallId !== undefined && !samePredecessor) continue;
+      if (!existing || existing.startedAt < change.record.startedAt ||
+          (existing.startedAt === change.record.startedAt && (!change.delayed || samePredecessor))) {
+        if (!change.delayed && sameTimestamp && onDisk.parentToolCallId !== change.record.parentToolCallId) {
+          change.predecessorToolCallId = onDisk.parentToolCallId;
+        }
         records.set(key, change.record);
       }
     }
@@ -1012,75 +1110,73 @@ export function createBackgroundTaskTracker(options: {
       deltas.push(...feedStreamingCompletions(thread, scan, block, final, maxLineChars, lineOverlap));
       if (final) state.plainScan = undefined;
     };
+    const feedOversized = (raw: string, final: boolean) => {
+      const oversized = state.oversized ??= { prefix: '' };
+      if (!oversized.kind) {
+        raw = oversized.prefix + raw;
+        const start = raw.replace(/^[ \t\r]*/, '');
+        if (!start) return;
+        const opener = start[0];
+        const next = start.slice(1).replace(/^[ \t\r]*/, '');
+        if (!final && (
+          ((opener === '{' || opener === '[') && !next) ||
+          (opener === '[' && ['true', 'false', 'null'].some(literal => literal.startsWith(next)))
+        )) {
+          oversized.prefix = opener + next;
+          return;
+        }
+        // Brackets also introduce plain log prefixes such as [INFO].
+        const json = opener === '"' ||
+          (opener === '{' && /^["}]/.test(next)) ||
+          (opener === '[' && JSON_ARRAY_START.test(next));
+        oversized.kind = json ? 'json' : 'plain';
+        oversized.prefix = '';
+      }
+      if (oversized.kind === 'plain') {
+        flushPlain(false);
+        const scan = state.plainScan ??= { buffer: '' };
+        deltas.push(...feedStreamingCompletions(thread, scan, final ? raw + '\n' : raw, false, maxLineChars, lineOverlap));
+        return;
+      }
+      flushPlain();
+      if (disposed || watchers.get(thread)?.get(path) !== state) return;
+      const json = oversized.json ??= { frames: [], skipDepth: 0, key: '', escape: '', hasText: false, done: false, invalid: false };
+      const text = readTranscriptJson(json, raw, maxLineChars);
+      if (!json.invalid) {
+        const scan = oversized.scan ??= { buffer: '' };
+        deltas.push(...feedStreamingCompletions(thread, scan, text, final && json.done, maxLineChars, lineOverlap));
+      }
+    };
     let pos = 0;
     while (pos < chunk.length) {
       if (disposed || watchers.get(thread)?.get(path) !== state) break;
       const nl = chunk.indexOf('\n', pos);
-      if (nl === -1) {
-        const rest = chunk.slice(pos);
-        if (state.oversizedLine) {
-          flushPlain();
-          if (disposed || watchers.get(thread)?.get(path) !== state) break;
-          const decoded = unescapeIncremental(state.oversizedBackslash, rest, false);
-          state.oversizedBackslash = decoded.carry;
-          state.oversizedScan ??= { buffer: '' };
-          deltas.push(...feedStreamingCompletions(thread, state.oversizedScan, decoded.text, false, maxLineChars, lineOverlap));
-        } else {
-          const combined = state.partial ? state.partial + rest : rest;
-          if (combined.length > maxLineChars) {
-            flushPlain();
-            if (disposed || watchers.get(thread)?.get(path) !== state) break;
-            state.oversizedLine = true;
-            state.partial = '';
-            const decoded = unescapeIncremental('', combined, false);
-            state.oversizedBackslash = decoded.carry;
-            state.oversizedScan = { buffer: '' };
-            deltas.push(...feedStreamingCompletions(thread, state.oversizedScan, decoded.text, false, maxLineChars, lineOverlap));
-          } else {
-            state.partial = combined;
-          }
+      const final = nl !== -1;
+      const line = state.partial + chunk.slice(pos, final ? nl : chunk.length);
+      pos = final ? nl + 1 : chunk.length;
+      state.partial = '';
+      if (state.oversized || line.length > maxLineChars) {
+        feedOversized(line, final);
+        if (final) state.oversized = undefined;
+      } else if (!final) {
+        state.partial = line;
+      } else if (line && (state.plainScan || plainLines.length || COMPLETION_HINT.test(line) || line.includes('\\u'))) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          plainLines.push(line);
+          continue;
         }
-        break;
-      }
-      const piece = chunk.slice(pos, nl);
-      pos = nl + 1;
-      if (state.oversizedLine) {
         flushPlain();
         if (disposed || watchers.get(thread)?.get(path) !== state) break;
-        const decoded = unescapeIncremental(state.oversizedBackslash, piece, true);
-        const scan = state.oversizedScan ?? { buffer: '' };
-        state.partial = '';
-        state.oversizedLine = false;
-        state.oversizedBackslash = '';
-        state.oversizedScan = undefined;
-        deltas.push(...feedStreamingCompletions(thread, scan, decoded.text, true, maxLineChars, lineOverlap));
-      } else {
-        const line = state.partial ? state.partial + piece : piece;
-        state.partial = '';
-        if (!line) continue;
-        if (line.length > maxLineChars) {
-          flushPlain();
-          if (disposed || watchers.get(thread)?.get(path) !== state) break;
-          if (COMPLETION_HINT.test(line)) {
-            deltas.push(...inspectTextForCompletions(thread, unescapeOversizedText(line)));
-          }
-        } else if (state.plainScan || plainLines.length > 0 || COMPLETION_HINT.test(line)) {
-          // Transcript records encode message text as JSON strings.
-          let parsed: unknown;
-          let isJson = false;
-          try { parsed = JSON.parse(line); isJson = true; } catch { /* plain text line */ }
-          if (isJson) {
-            flushPlain();
-            if (disposed || watchers.get(thread)?.get(path) !== state) break;
-            const extracted = extractToolOutputText({ toolCallId: '', rawOutput: parsed }).replace(/\\"/g, '"');
-            if (extracted) deltas.push(...inspectTextForCompletions(thread, extracted));
-          } else {
-            plainLines.push(line);
-          }
+        const extracted = extractTranscriptText(parsed);
+        if (COMPLETION_HINT.test(extracted)) {
+          deltas.push(...inspectTextForCompletions(thread, extracted));
         }
       }
     }
-    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain(!remaining && !state.partial);
+    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain(!remaining && !state.partial && !state.oversized);
     return deltas;
   }
   function scheduleCatchUp() {
@@ -1106,9 +1202,7 @@ export function createBackgroundTaskTracker(options: {
         if (size < state.offset) {
           state.offset = 0;
           state.partial = '';
-          state.oversizedLine = false;
-          state.oversizedBackslash = '';
-          state.oversizedScan = undefined;
+          state.oversized = undefined;
           state.plainScan = undefined;
           state.decoder = new StringDecoder('utf8');
         }
@@ -1201,7 +1295,7 @@ export function createBackgroundTaskTracker(options: {
       if (!paths.has(task.transcriptPath)) {
         let offset = 0;
         try { offset = statSync(task.transcriptPath).size; } catch { /* Start at zero when the file appears. */ }
-        paths.set(task.transcriptPath, { offset, partial: '', oversizedLine: false, oversizedBackslash: '', decoder: new StringDecoder('utf8') });
+        paths.set(task.transcriptPath, { offset, partial: '', decoder: new StringDecoder('utf8') });
       }
       watchers.set(thread, paths);
       if (!timer) { timer = setInterval(poll, interval); timer.unref(); }

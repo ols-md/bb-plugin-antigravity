@@ -106,6 +106,49 @@ test('oversized single transcript lines stay bounded and still recover embedded 
   assert.equal(byId.get('conv/after-line')?.item.summary, 'all green');
 });
 
+test('JSONL completion scanning selects decoded message text and ignores metadata', async t => {
+  for (const { name, padding, readBytes } of [
+    { name: 'normal line', padding: '', readBytes: 8192 },
+    { name: 'oversized line in one read', padding: 'x'.repeat(3000), readBytes: 8192 },
+    { name: 'oversized line split across reads', padding: 'x'.repeat(3000), readBytes: 17 },
+  ]) {
+    await t.test(name, async t => {
+      const { transcript, logFor } = createTranscriptFixture(t, 'bg-transcript-fields-');
+      const tr = tracker(t, { pollIntervalMs: 5, maxTranscriptReadBytes: readBytes, maxTranscriptLineChars: 1024 });
+      const falseCompletion = 'Task id "conv/active" finished with result: Command exited with code 7';
+      tr.handleToolEventForThread('t', command('conv/active', logFor('active')));
+      tr.handleToolEventForThread('t', command('conv/barrier', logFor('barrier')));
+
+      const message = String.raw`"\u0054ask id \u0022conv\/barrier\u0022 finished with result: caf\u00e9 \"ok\" \\\"literal\"\b\f"`;
+      const hiddenAnnouncement = JSON.stringify(falseCompletion).replace('Task', String.raw`\u0054ask`);
+      const nested = String.raw`{"\u0063ontent":[{"output":{"text":${message}}},{"metadata":${hiddenAnnouncement}}],"metadata":"Encountered error"}`;
+      appendFileSync(transcript, [
+        JSON.stringify({ metadata: padding + falseCompletion }),
+        `[${JSON.stringify(padding)},${nested}]`,
+        '',
+      ].join('\n'));
+
+      await until(() => !tr.getActiveTasks('t').some(task => task.taskId === 'conv/barrier'));
+      assert.deepEqual(tr.getActiveTasks('t').map(task => task.taskId), ['conv/active']);
+      const close = tr.async.flatMap(entry => entry.deltas).find(d => d.item?.familyId === 'conv/barrier');
+      assert.equal(close?.status, 'completed');
+      assert.equal(close?.item.summary, 'café "ok" \\"literal"\b\f'.trim());
+    });
+  }
+});
+
+test('oversized bracket-prefixed plain output keeps literal escapes and a late exit status', async t => {
+  const { transcript, logFor } = createTranscriptFixture(t, 'bg-oversized-plain-');
+  const tr = tracker(t, { pollIntervalMs: 5, maxTranscriptReadBytes: 4096, maxTranscriptLineChars: 1024, maxRetainedToolOutputChars: 256 });
+  tr.handleToolEventForThread('t', command('conv/plain', logFor('plain')));
+  appendFileSync(transcript, `[INFO] ${'x'.repeat(150_000)} Task id "conv/plain" finished with result: details\\n ${'y'.repeat(5000)} Command exited with code 5\n`);
+
+  await until(() => tr.getActiveTasks('t').length === 0);
+  const close = tr.async.flatMap(entry => entry.deltas).find(d => d.kind === 'item.close');
+  assert.equal(close?.status, 'failed');
+  assert.match(close?.item.summary, /^details\\n /);
+});
+
 test('bounded transcript polling maintains thread isolation when one thread has a large backlog', async t => {
   const heavy = createTranscriptFixture(t, 'bg-iso-heavy-');
   const fast = createTranscriptFixture(t, 'bg-iso-fast-');

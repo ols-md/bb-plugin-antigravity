@@ -724,6 +724,45 @@ test('live lock markers are never evicted by age and yielding removes only the c
 const fsError = (code, message = code) => Object.assign(new Error(message), { code });
 const drainTimers = (t, steps = 40, stepMs = 1_000) => { for (let i = 0; i < steps; i++) t.mock.timers.tick(stepMs); };
 
+for (const [description, beforeRetry, afterRetry] of [
+  ['replaces the observed predecessor', 'predecessor', 'queued-replacement'],
+  ['preserves a newer replacement', 'newer-replacement', 'newer-replacement'],
+  ['saves the replacement after the predecessor is cleared', null, 'queued-replacement'],
+]) {
+  test(`same-millisecond rename retry ${description}`, t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.method(Math, 'random', () => 0);
+    t.mock.method(Date, 'now', () => 12345);
+    const path = statePath(t);
+    const register = (tr, toolCallId) => tr.handleToolEventForThread('thread', command('same', { toolCallId }));
+    const savedCalls = () => JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.parentToolCallId);
+    const first = tracker(t, { persistPath: path });
+    register(first, 'predecessor');
+
+    let renameAttempts = 0;
+    const replacing = tracker(t, {
+      persistPath: path,
+      taskStateFs: {
+        renameSync(source, target) {
+          if (++renameAttempts === 1) throw fsError('EBUSY');
+          renameSync(source, target);
+        },
+      },
+    });
+    register(replacing, 'queued-replacement');
+    assert.equal(renameAttempts, 1);
+    assert.deepEqual(savedCalls(), ['predecessor']);
+
+    if (beforeRetry === null) first.clearThread('thread');
+    else if (beforeRetry !== 'predecessor') register(tracker(t, { persistPath: path }), beforeRetry);
+    assert.deepEqual(savedCalls(), beforeRetry === null ? [] : [beforeRetry]);
+
+    t.mock.timers.tick(10);
+    assert.equal(renameAttempts, 2);
+    assert.deepEqual(savedCalls(), [afterRetry]);
+  });
+}
+
 test('transient startup reads retry and populate restart inventory and stale-record GC', t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   t.mock.method(Math, 'random', () => 0);
