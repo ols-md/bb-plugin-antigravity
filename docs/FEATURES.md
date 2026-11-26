@@ -2,11 +2,17 @@
 
 Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.109 on Windows. A terminal CLI feature does not imply that the same feature is exposed through ACP.
 
+## Linux
+
+We expect the plugin to work on Linux. Ubuntu CI passed for [PR #52](https://github.com/ols-md/bb-plugin-antigravity/pull/52). In a local Alpine Linux 3.24.4 x86_64 Docker container with Node.js 24.22.3, the typecheck and 153 tests passed, including five compaction tests. The suite skipped four Windows-only tests.
+
 The contributor in issue #29 reported tests on Unraid with Node.js 26 and Antigravity CLI 1.5.14. The tests used real BB threads and covered the fork's ACP proxy, conversation forking, and compaction. [Contributor's test report](https://github.com/mturilin/bb-plugin-antigravity/commit/3323a3a40445e58d62a70a24ca242e4e3fdcfd4c)
 
-Typechecking and all 148 portable tests passed on Ubuntu CI (Node.js 24) and in a clean Alpine Linux 3.24 container (Node.js 24.22.3). In Alpine, a simulated `agy` also passed CLI discovery, version diagnostics, usage reporting, mode switching, and bridge turn, approval, and session resume checks.
+In an earlier Alpine test, a simulated `agy` also passed CLI discovery, version diagnostics, usage reporting, mode switching, and bridge turn, approval, and session resume checks.
 
-Signed-in validation of the released plugin on a Linux agent host remains open. For that test, record the OS, Node.js, BB, and `agy` versions. Check live turns, session resume, and tool approvals.
+A signed-in Linux test of the plugin from this repository is still pending. For that test, record the OS, Node.js, BB, and `agy` versions. Check live turns, session resume, and tool approvals.
+
+## Features
 
 | Feature | Current integration |
 | --- | --- |

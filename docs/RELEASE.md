@@ -23,7 +23,7 @@ npm pack --dry-run
 bb plugin publish --check
 ```
 
-Verify a clean Git-source installation in BB. Check streaming, cancellation, permission approval and denial, editing, and resumed conversations. Keep signed-in CLI smoke tests outside public PR automation. If you run `npm run smoke -- --prompt`, it can consume quota. Windows has been tested locally. Validate macOS and Linux before claiming support for them.
+Verify a clean Git-source installation in BB. Check streaming, cancellation, permission approval and denial, editing, and resumed conversations. Keep signed-in CLI smoke tests outside public PR automation. If you run `npm run smoke -- --prompt`, it can consume quota. Signed-in tests passed on Windows. We expect the plugin to work on Linux. A signed-in Linux test and macOS validation are still pending.
 
 ## Publish and verify the listing
 

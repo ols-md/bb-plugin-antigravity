@@ -12,7 +12,7 @@ Plan and code in [BB](https://getbb.app) with your installed Google Antigravity 
 
 **[Install from the BB Community marketplace](https://getbb.app/marketplace/antigravity-cli)** · [Setup](#getting-started) · [Contribute](#development) · [Security](SECURITY.md)
 
-**Experimental.** Tested on Windows. macOS and Linux still need validation.
+**Experimental.** We tested the plugin on Windows with Antigravity CLI 1.5.18 signed in. We expect it to work on Linux. macOS still needs validation. [Linux test results](docs/FEATURES.md#linux)
 
 - Choose an available model and reasoning level in the BB provider picker.
 - Use the CLI's native Plan mode to outline a task. Switch to Build to implement it.
@@ -177,7 +177,7 @@ For future terminals, add `%LOCALAPPDATA%\agy\bin` to your user **Path** in Wind
 
 Contributions are welcome. Choose a starting point for your change.
 
-- **Validate macOS or Linux.** Install the plugin from the marketplace. Sign in to the CLI. In BB, select a model and try both Plan and Build. Remove private data from your logs. Report your OS, BB version, CLI version, and results in [GitHub Issues](https://github.com/ols-md/bb-plugin-antigravity/issues).
+- **Test a signed-in session on macOS or Linux.** Install the plugin from the marketplace. Sign in to the CLI. In BB, select a model and try both Plan and Build. Remove private data from your logs. Report your OS, BB version, CLI version, and results in [GitHub Issues](https://github.com/ols-md/bb-plugin-antigravity/issues).
 - **Improve CLI setup or diagnostics.** Start with [CLI discovery and health checks](cli.ts) and [CLI tests](tests/cli.test.mjs).
 - **Improve Plan and Build.** Start with [mode controls](mode-controls.ts) and [mode tests](tests/mode-controls.test.mjs).
 - **Improve quota reporting.** Start with [usage reporting](usage.ts) and [usage tests](tests/usage.test.mjs).

@@ -16,6 +16,6 @@ With **Accept edits**, the CLI applies its native editing permissions. By defaul
 
 ## Requirements
 
-You need BB 0.48 or later, Node.js 22 or later, and the standalone Antigravity CLI with `agy acp` available on the agent host. Sign in to an eligible Antigravity account on that host, including when you run the agent remotely. Antigravity quota or charges apply. This experimental provider has been tested locally on Windows. macOS and Linux still need validation.
+You need BB 0.48 or later, Node.js 22 or later, and the standalone Antigravity CLI with `agy acp` available on the agent host. Sign in to an eligible Antigravity account on that host, including when you run the agent remotely. Antigravity quota or charges apply. We tested this experimental provider on Windows with the CLI signed in. We expect it to work on Linux. macOS still needs validation.
 
 See the [setup instructions](https://github.com/ols-md/bb-plugin-antigravity#getting-started) for installation and sign-in.
