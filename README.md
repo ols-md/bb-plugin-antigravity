@@ -119,7 +119,9 @@ The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. O
 
 **Disable provider subagents** is off by default. When enabled, the plugin instructs Antigravity CLI not to use its native subagent tools (`invoke_subagent`, `define_subagent`, `manage_subagents`, `send_message`) so agents delegate work through BB threads (`bb thread spawn --parent-self`), and automatically denies native subagent approval prompts (taking precedence over automatic approval).
 
-**Show command descriptions** is on by default. When enabled, command execution cards display Antigravity's `toolSummary` as the title with the raw command line as the subtitle, along with an **Outside of sandbox** badge whenever `BypassSandbox` is requested.
+**Show command descriptions** is on by default. When this setting is on, the plugin trims Antigravity's `toolSummary` and the command line for comparison. If the trimmed description contains text and differs from the trimmed command line, the card shows the description as the title. In this case, if the command line is available, the card shows it as the subtitle.
+
+If the tool sends a request to run a command outside the sandbox, the command card shows the **Outside of sandbox** badge. When **Show command descriptions** is off, the card shows this badge for these requests.
 
 The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
