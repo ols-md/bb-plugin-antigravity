@@ -4,7 +4,7 @@
 
 <h1 align="center">Antigravity CLI Provider for BB</h1>
 
-[![Latest GitHub release](https://img.shields.io/github/v/release/ols-md/bb-plugin-antigravity)](https://github.com/ols-md/bb-plugin-antigravity/releases/latest)
+[![Latest GitHub release](https://img.shields.io/github/v/release/ols-md/bb-plugin-antigravity?logo=github)](https://github.com/ols-md/bb-plugin-antigravity/releases/latest)
 [![Public repository checks on main](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml)
 [![MIT license](https://img.shields.io/github/license/ols-md/bb-plugin-antigravity)](LICENSE)
 
