@@ -41,7 +41,7 @@
     "node": ">=22"
   },
   "bb": {
-    "name": "Antigravity CLI [Experimental]",
+    "name": "Antigravity CLI Provider [Experimental]",
     "description": "Plan and code with Google Antigravity inside BB. Choose your model and reasoning level, and review tool requests in your thread. Check quota and reset times in BB. You need the standalone Antigravity CLI and an eligible account. Antigravity quota or charges apply. Tested on Windows.",
     "branding": {
       "icon": "./assets/icon.svg"

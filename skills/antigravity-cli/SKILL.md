@@ -3,7 +3,7 @@ name: antigravity-cli
 description: Spawn, configure, or troubleshoot Antigravity CLI (antigravity-cli) threads in BB — models, reasoning levels (low, medium, high, xhigh, max), quota/usage windows, Build/Plan work modes, permissions, and sign-in.
 ---
 
-# Antigravity CLI provider
+# Antigravity CLI Provider
 
 Threads on the `antigravity-cli` provider run the locally installed Antigravity CLI (`agy acp --disable-telemetry`) through BB's shared ACP bridge.
 
@@ -45,7 +45,7 @@ Work mode and permissions are separate controls:
 
 - `agy` must be installed on the target host, on `PATH` or in the standard installer location (`agy --version`, `agy acp --help`).
 - Sign in on the target host with `agy acp --login`.
-- Plugin settings (`Settings -> Installed plugins -> Antigravity CLI`):
+- Plugin settings (`Settings -> Installed plugins -> Antigravity CLI Provider [Experimental]`):
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.
   - `sandbox` (default `false`): pass `--sandbox` when starting new threads (when `false`, inherits CLI settings).
   - `autoApprove` (default `false`): automatically answer ACP permission requests in Accept edits mode on new turns, including requests to run outside the CLI sandbox. It preserves the selected permission mode and direct ACP filesystem restrictions; host policy denying escalation still applies. Full access already auto-approves requests.
