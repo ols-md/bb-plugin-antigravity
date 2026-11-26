@@ -486,7 +486,9 @@ test('commandResult extracts exit code from rawOutput object or output text', ()
   );
 });
 
-test('classifyToolCall: run_command with descriptions enabled and disabled', () => {
+test('classifyToolCall: run_command with descriptions enabled and disabled', (t) => {
+  const previousSetting = getCommandDescriptionsEnabled();
+  t.after(() => setCommandDescriptionsEnabled(previousSetting));
   setCommandDescriptionsEnabled(true);
   const event1 = {
     toolCallId: 'cmd_1',
@@ -538,6 +540,11 @@ test('classifyToolCall: run_command with descriptions enabled and disabled', () 
   assert.equal(classified3.presentation.title, 'git status');
   assert.equal(classified3.presentation.detail, undefined);
   assert.equal(classified3.presentation.subtitle, undefined);
+
+  const withoutDescription = classifyToolCall(event2).presentation;
+  assert.equal(withoutDescription.title, event2.rawInput.CommandLine);
+  assert.deepEqual(withoutDescription.badge, classified2.presentation.badge);
+  assert.deepEqual(withoutDescription.badges, classified2.presentation.badges);
 
   // Backgrounded command
   setCommandDescriptionsEnabled(true);
