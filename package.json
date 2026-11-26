@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-antigravity-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "type": "module",
   "license": "MIT",
   "description": "Use the installed Antigravity CLI as an ACP agent in BB.",
@@ -50,7 +50,8 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.6.141"
+    "@get-bb/plugin-sdk": "0.6.178",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "typescript": "^7.0.2",

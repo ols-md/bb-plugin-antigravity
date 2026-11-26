@@ -5,8 +5,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { resolveAntigravityCommand } from '../cli.ts';
+import manifest from '../package.json' with { type: 'json' };
+
+const command = resolveAntigravityCommand('agy');
+if (!command) throw new Error('Antigravity CLI was not found on this host.');
 const cwd = await mkdtemp(join(tmpdir(), 'bb-antigravity-smoke-'));
-const child = spawn('agy', ['acp', '--disable-telemetry'], { cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+const child = spawn(command, ['acp', '--disable-telemetry'], { cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+const closed = new Promise(resolve => child.once('close', resolve));
 const pending = new Map();
 let id = 0;
 let response = '';
@@ -27,13 +33,13 @@ lines.on('line', line => {
   } else if (message.id !== undefined) {
     const request = pending.get(message.id);
     pending.delete(message.id);
-    if (message.error) request?.reject(new Error('ACP request rejected'));
+    if (message.error) request?.reject(new Error(`ACP rejected ${request.method} (code ${Number(message.error.code)}).`));
     else request?.resolve(message.result);
   }
 });
 function request(method, params) {
   return new Promise((resolve, reject) => {
-    pending.set(++id, { resolve, reject });
+    pending.set(++id, { method, resolve, reject });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
 }
@@ -41,7 +47,7 @@ const timeout = setTimeout(() => { child.kill(); process.exitCode = 1; }, 60000)
 child.on('error', () => { for (const p of pending.values()) p.reject(new Error('Could not launch agy')); });
 child.on('exit', () => { for (const p of pending.values()) p.reject(new Error('ACP exited before completing')); });
 try {
-  const initialized = await request('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'bb-antigravity-smoke', version: '0.1.1' } });
+  const initialized = await request('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'bb-antigravity-smoke', version: manifest.version } });
   assert.equal(initialized.protocolVersion, 1);
   if (process.argv.includes('--capabilities')) console.log(JSON.stringify(initialized.agentCapabilities, null, 2));
   const session = await request('session/new', { cwd, mcpServers: [] });
@@ -70,9 +76,8 @@ try {
 } finally {
   clearTimeout(timeout);
   lines.close();
-  const exited = new Promise(resolve => child.once('close', resolve));
   child.kill();
-  await exited;
+  await closed;
   await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 

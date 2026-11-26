@@ -67,7 +67,7 @@ export type TrackerDelta = BackgroundTaskDelta | SilentTurnInjectionDelta | Turn
 /** Default wait for the CLI's reactive follow-up turn after every blocking task settled. */
 export const DEFAULT_HOLD_SETTLE_GRACE_MS = 20_000;
 /** Default upper bound on how long one turn can be held open for background work. */
-export const DEFAULT_MAX_TURN_HOLD_MS = 30 * 60 * 1000;
+export const DEFAULT_MAX_TURN_HOLD_MS = 5 * 60 * 1000;
 const TERMINAL_TOOL_STATUS = /^(?:completed|failed|cancell?ed)$/;
 // After this many consecutive silent turns (failed empty-output command, no agent text),
 // the injected message escalates to "command execution appears broken in this session".
@@ -117,21 +117,6 @@ function mergeToolEvent(previous: RecordedToolEvent | undefined, event: Recorded
  */
 const DEFAULT_TASK_STATE_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 
-/**
- * Stable per-host location for the persisted background-task state file.
- *
- * Why `~/.bb/plugin-data/bb-plugin-antigravity/background-tasks.json`:
- * - The plugin host process must be able to write it and it must survive host restarts, so a
- *   fixed per-user path beats anything under a thread workspace (which may not exist or be
- *   writable when the tracker starts, and is not unique per plugin host).
- * - Unlike an OS temp dir, which cleanup tools may wipe, the user's `.bb` area is persistent
- *   across reboots; namespacing it by plugin name avoids collisions with other BB plugins (the
- *   file itself is versioned for the same reason).
- * - Concurrent plugin hosts on the same machine share this one file; records are keyed by
- *   thread id and writes merge with the current on-disk state, so hosts never clobber each
- *   other's threads.
- * `BB_ANTIGRAVITY_TASK_STATE_DIR` overrides the directory; tests inject a temp path instead.
- */
 export function defaultBackgroundTaskStatePath(): string {
   const override = process.env.BB_ANTIGRAVITY_TASK_STATE_DIR?.trim();
   const dir = override || join(homedir(), '.bb', 'plugin-data', 'bb-plugin-antigravity');
@@ -175,7 +160,7 @@ function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean
     return true;
   } catch {
     // Best effort: persistence trouble (missing dir permissions, full disk, ...) must never
-    // crash the plugin host; the tracker simply continues in memory-only mode.
+    // crash the plugin host. Keep pending changes for the next save.
     return false;
   }
 }
@@ -203,9 +188,6 @@ export function createBackgroundTaskTracker(options: {
   const interval = options.pollIntervalMs ?? 500;
   const persistPath = options.persistPath || undefined;
   const maxAge = options.taskStateMaxAgeMs ?? DEFAULT_TASK_STATE_MAX_AGE_MS;
-  /** Threads this tracker registered, settled, or cleared; only their records are ever rewritten. */
-  const touchedThreads = new Set<string>();
-  let lastWritten = '';
   const taskKey = (task: Pick<BackgroundTask, 'taskType' | 'taskId'>) => `${task.taskType === 'local_subagent' ? 'subagent' : 'task'}:${task.taskId}`;
   // Silent-turn detection state (issue: turn ends with no agent message after a failed
   // command with empty output, so BB records "No final output was recorded").
@@ -273,21 +255,28 @@ export function createBackgroundTaskTracker(options: {
     ...(task.transcriptPath ? { transcriptPath: task.transcriptPath } : {}),
     ...(task.outputFile ? { outputFile: task.outputFile } : {}),
   });
-  /**
-   * Merges this tracker's live tasks into the state file: records for the threads this tracker
-   * has touched are replaced with the in-memory tasks (dropping settled/cleared ones), and every
-   * other thread's records are preserved, so concurrent plugin hosts never clobber each other.
-   */
-  function persistState() {
+  const recordKey = (record: PersistedBackgroundTask) => JSON.stringify([record.threadId, taskKey(record)]);
+  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean }>();
+  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
     if (!persistPath) return;
-    const previous = readTaskState(persistPath, maxAge);
-    const records = [
-      ...previous.filter(record => !touchedThreads.has(record.threadId)),
-      ...[...touchedThreads].flatMap(thread => [...(threads.get(thread)?.values() ?? [])].map(task => toRecord(thread, task))),
-    ].sort((a, b) => a.threadId === b.threadId ? a.taskId.localeCompare(b.taskId) : a.threadId.localeCompare(b.threadId));
-    const json = JSON.stringify({ version: 1, tasks: records });
-    if (json === lastWritten) return;
-    if (writeTaskState(persistPath, records)) lastWritten = json;
+    for (const task of tasks) {
+      const record = toRecord(thread, task);
+      const key = recordKey(record);
+      pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove });
+      initialRecords.delete(key);
+    }
+    if (!pendingWrites.size) return;
+    const records = new Map(readTaskState(persistPath, maxAge).map(record => [recordKey(record), record]));
+    for (const change of pendingWrites.values()) {
+      const key = recordKey(change.record);
+      const existing = records.get(key);
+      if (change.remove) {
+        if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
+      } else if (!existing || existing.startedAt <= change.record.startedAt) {
+        records.set(key, change.record);
+      }
+    }
+    if (writeTaskState(persistPath, [...records.values()])) pendingWrites.clear();
   }
   /**
    * Restart reconciliation: `clearThread`-shaped `interrupted` closes for persisted tasks of a
@@ -298,14 +287,17 @@ export function createBackgroundTaskTracker(options: {
     if (!persistPath) return [];
     const records = readTaskState(persistPath, maxAge);
     const active = threads.get(thread);
-    const pending = records.filter(record => record.threadId === thread && !active?.has(taskKey(record)) && initialRecordKeys.has(`${record.threadId}\u0000${record.taskId}`));
+    const pending = records.filter(record => {
+      const initial = initialRecords.get(recordKey(record));
+      return record.threadId === thread && !active?.has(taskKey(record)) &&
+        initial?.startedAt === record.startedAt && initial.parentToolCallId === record.parentToolCallId;
+    });
     if (!pending.length) return [];
     const results = pending.map(record => delta({
       taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
       ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
     }, 'interrupted', 'stopped'));
-    touchedThreads.add(thread);
-    persistState();
+    persistTasks(thread, pending, true);
     return results;
   }
   function syncPolling() {
@@ -319,13 +311,17 @@ export function createBackgroundTaskTracker(options: {
   }
   function settle(thread: string, id: string, status: NonNullable<BackgroundTaskDelta['status']>, taskStatus: string, summary?: string, type?: BackgroundTask['taskType']) {
     const tasks = threads.get(thread);
+    const removed: BackgroundTask[] = [];
     const results: BackgroundTaskDelta[] = [];
     for (const [key, task] of tasks ?? []) {
-      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); results.push(delta(task, status, taskStatus, summary)); }
+      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, summary)); }
     }
     if (!tasks?.size) threads.delete(thread);
     syncPolling();
-    if (results.length) { touchedThreads.add(thread); persistState(); armSettleGrace(thread); }
+    if (removed.length) {
+      persistTasks(thread, removed, true);
+      armSettleGrace(thread);
+    }
     return results;
   }
   function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
@@ -432,7 +428,7 @@ export function createBackgroundTaskTracker(options: {
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
     if (tasks.has(taskKey(task))) return [];
     tasks.set(taskKey(task), task); threads.set(thread, tasks);
-    touchedThreads.add(thread); persistState();
+    persistTasks(thread, [task], false);
     if (task.transcriptPath && interval > 0) {
       const paths = watchers.get(thread) ?? new Map();
       if (!paths.has(task.transcriptPath)) {
@@ -488,6 +484,8 @@ export function createBackgroundTaskTracker(options: {
     bridgeTurnOpen: boolean;
     /** BB's turn was closed while an absorbed bridge turn was still open; drop that turn's boundary. */
     dropNextBoundary: boolean;
+    /** Let an active bridge prompt finish after the idle wait budget expires. */
+    finishAtBoundary?: boolean;
     /** JSON-RPC id of a steer rewritten into turn/start, until the bridge answers it. */
     steerRequestId?: string | number;
     graceTimer?: ReturnType<typeof setTimeout>;
@@ -538,7 +536,10 @@ export function createBackgroundTaskTracker(options: {
   function beginHold(thread: string, boundary: TurnBoundaryDelta) {
     const hold: TurnHold = { boundary, bridgeTurnOpen: false, dropNextBoundary: false };
     holds.set(thread, hold);
-    hold.capTimer = setTimeout(() => releaseHoldAsync(thread, true), maxHoldMs);
+    hold.capTimer = setTimeout(() => {
+      if (hold.bridgeTurnOpen) hold.finishAtBoundary = true;
+      else releaseHoldAsync(thread, true);
+    }, maxHoldMs);
     hold.capTimer.unref?.();
   }
   /**
@@ -558,6 +559,7 @@ export function createBackgroundTaskTracker(options: {
   function routeTurnOpen(thread: string): boolean {
     const hold = holds.get(thread);
     if (hold?.boundary) {
+      exemptAfterHold(thread, false);
       hold.bridgeTurnOpen = true;
       if (hold.graceTimer) { clearTimeout(hold.graceTimer); hold.graceTimer = undefined; }
       return false;
@@ -572,7 +574,7 @@ export function createBackgroundTaskTracker(options: {
     if (hold?.boundary) {
       // After an absorbed turn, only keep waiting on work whose end is observable: a reactive
       // wakeup is itself the CLI's notice that unobservable work finished.
-      if (hold.bridgeTurnOpen) exemptAfterHold(thread, false);
+      if (hold.finishAtBoundary) exemptAfterHold(thread, true);
       hold.bridgeTurnOpen = false;
       if (boundary.status === 'completed' && holdBlockers(thread).length) {
         hold.boundary = boundary;
@@ -611,10 +613,13 @@ export function createBackgroundTaskTracker(options: {
   }
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
-    const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
     if (holds.get(thread)?.boundary) dropHold(thread);
+    const active = getActiveTasks(thread);
+    const results = emitCloseDeltas ? active.map(task => delta(task, 'interrupted', 'stopped')) : [];
     threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
-    touchedThreads.add(thread); persistState(); return results;
+    const recovered = [...initialRecords.values()].filter(record => record.threadId === thread);
+    persistTasks(thread, [...recovered, ...active], true);
+    return results;
   }
   function handleInbound(request: unknown): { request: unknown; deltas: TrackerDelta[] } {
     const message = request as { method?: string; params?: { threadId?: string } } | null;
@@ -625,7 +630,6 @@ export function createBackgroundTaskTracker(options: {
       // Stop never waits on a held turn: close it as interrupted. If the bridge still has an
       // absorbed turn open, it emits its own interrupted boundary, which is then dropped.
       const released = releaseHold(thread, 'interrupted');
-      if (method === 'thread/discard') holds.delete(thread);
       return { request, deltas: [...clearThread(thread, true), ...released] };
     }
     const hold = holds.get(thread);
@@ -644,7 +648,13 @@ export function createBackgroundTaskTracker(options: {
     // before the CLI sees the resume. Cleaner than keying off processStdoutLine activity,
     // which also arrives mid-turn for cases that are not resumes at all.
     // A new turn while a turn is held closes the held one first, keeping turn state balanced.
-    if (method === 'turn/start') return { request, deltas: [...releaseHold(thread), ...reconcilePersisted(thread)] };
+    if (method === 'turn/start') {
+      exemptAfterHold(thread, true);
+      // An active prompt may still send text before the SDK closes it.
+      if (hold?.bridgeTurnOpen) hold.finishAtBoundary = true;
+      const released = hold?.bridgeTurnOpen ? [] : releaseHold(thread);
+      return { request, deltas: [...released, ...reconcilePersisted(thread)] };
+    }
     if (method === 'thread/resume') return { request, deltas: reconcilePersisted(thread) };
     return { request, deltas: [] };
   }
@@ -653,10 +663,11 @@ export function createBackgroundTaskTracker(options: {
   // across restarts, even if no traffic ever arrives. Persisted records are intentionally NOT
   // dropped on dispose(): a graceful host exit is indistinguishable from a crash here, and the
   // next resume must still report the tasks as interrupted.
-  const initialRecordKeys = new Set<string>();
+  const initialRecords = new Map<string, PersistedBackgroundTask>();
   if (persistPath) {
-    for (const record of readTaskState(persistPath, maxAge)) initialRecordKeys.add(`${record.threadId}\u0000${record.taskId}`);
-    persistState();
+    const records = readTaskState(persistPath, maxAge);
+    for (const record of records) initialRecords.set(recordKey(record), record);
+    writeTaskState(persistPath, records);
   }
   return {
     recordToolEvent(event: RecordedToolEvent) {
@@ -670,7 +681,7 @@ export function createBackgroundTaskTracker(options: {
       let message;
       try { message = JSON.parse(line); } catch { return [line]; }
       const response = steerResponse(message);
-      if (response) return response.failed ? [line, ...deltaLines(response.thread, releaseHold(response.thread))] : [line];
+      if (response) return response.failed ? [line, ...deltaLines(response.thread, releaseHold(response.thread, 'interrupted'))] : [line];
       const params = message?.params;
       if (message?.method !== 'thread/delta' || typeof params?.threadId !== 'string' || !Array.isArray(params.deltas)) return [line];
       const extra: BackgroundTaskDelta[] = [];
@@ -692,16 +703,16 @@ export function createBackgroundTaskTracker(options: {
           const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
           const known = tools.get(id);
           const merged = event ? mergeToolEvent(known, event) : known;
-          if (event) { tools.set(id, merged!); threadTools.set(params.threadId, tools); }
+          if (event && merged) { tools.set(id, merged); threadTools.set(params.threadId, tools); }
           if (merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? '')) {
-            // The bridge flushed a call the CLI never finished (prompt ended mid-command).
+            // SDK 0.6.178 flushes unfinished commands this way. The ACP integration test covers this shape.
             extra.push(...registerOrphanCommand(params.threadId, merged));
-          } else if (event && merged && (merged.status === 'completed' || merged.status === 'failed' || entry?.kind === 'item.close')) {
+          } else if (event && merged && (TERMINAL_TOOL_STATUS.test(merged.status ?? '') || entry?.kind === 'item.close')) {
             extra.push(...settleOrphanCommand(params.threadId, merged));
             extra.push(...handleToolEventForThread(params.threadId, merged));
           }
         }
-        if (entry?.settlesTurn === true) dropHold(params.threadId); // e.g. provider.error: BB settles the turn itself.
+        if (entry?.settlesTurn === true) { exemptAfterHold(params.threadId, true); dropHold(params.threadId); } // e.g. provider.error: BB settles the turn itself.
         if (entry?.kind === 'turn.open' && !routeTurnOpen(params.threadId)) { modified = true; continue; }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
           streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
@@ -732,6 +743,7 @@ export function createBackgroundTaskTracker(options: {
         }
         if (entry?.kind === 'turn.boundary') {
           // Held or dropped boundaries do not end the logical turn, so silent-turn state carries over.
+          ordered.push(...extra.splice(0));
           const route = routeTurnBoundary(params.threadId, entry);
           if (route !== 'forward') { modified = true; continue; }
           if (!boundarySeen) {

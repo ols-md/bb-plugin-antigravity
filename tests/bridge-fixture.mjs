@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { experimental_providerBridge as bridge } from '../host.ts';
+import { experimental_providerBridge as bridge } from './isolated-host.mjs';
 
 const enabled = process.argv[2] === 'true';
 const originalWrite = process.stdout.write.bind(process.stdout);
@@ -45,6 +45,7 @@ try {
   assert.match(JSON.stringify(messages), /"Outside of sandbox"/);
 
   if (enabled) {
+    await wait(m => m.params?.deltas?.some(delta => delta.kind === 'turn.boundary'));
     const subagentOptions = {
       ...options,
       providerOptions: { ...options.providerOptions, subagentsDisabled: true },

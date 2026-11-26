@@ -553,6 +553,14 @@ test('classifyToolCall: run_command with descriptions enabled and disabled', () 
   assert.equal(classified4.presentation.label.completed, 'Started background command');
 });
 
+test('a command summary identical to the command needs only a title', () => {
+  const card = classifyToolCall({ toolCallId: 'same-summary', title: 'run_command',
+    rawInput: { CommandLine: 'git status', toolSummary: ' git status ' } });
+  assert.equal(card.presentation.title, 'git status');
+  assert.equal(card.presentation.subtitle, undefined);
+  assert.equal(card.presentation.detail, undefined);
+});
+
 test('classifyToolCall: invoke_subagent builds delegation card', () => {
   const event = {
     toolCallId: 'sub_1',

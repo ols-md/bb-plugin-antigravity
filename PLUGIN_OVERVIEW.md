@@ -6,12 +6,12 @@ BB can list native personal and workspace Antigravity skills, show live backgrou
 
 ## Permissions and sandbox
 
-Accept edits uses the CLI's native editing mode and forwards remaining ACP approval requests to BB. Full access automatically approves ACP permission requests, potentially including requests to execute outside the terminal sandbox. Plan is agent behavior, not enforced read-only access.
+Accept edits uses the CLI's native editing mode and forwards remaining ACP approval requests to BB by default. The automatic approval setting can approve those requests, including commands outside the sandbox. Full access automatically approves ACP permission requests, potentially including requests to execute outside the terminal sandbox. Plan is agent behavior, not enforced read-only access.
 
 The plugin inherits the CLI's sandbox configuration. Sandbox availability depends on your operating system and CLI version. See the [Antigravity sandbox documentation](https://antigravity.google/docs/sandbox/?tab=cli).
 
 ## Requirements
 
-Requires BB 0.48+, Node.js 22+, a separately installed Antigravity CLI with `agy acp` on the agent host's PATH, and an eligible signed-in account. Provider quota or charges apply. The desktop application alone is insufficient; remote hosts need their own CLI installation and sign-in.
+Requires BB 0.48+, Node.js 22+, a separately installed Antigravity CLI with `agy acp` available on the agent host, and an eligible signed-in account. Provider quota or charges apply. The desktop application alone is insufficient; remote hosts need their own CLI installation and sign-in.
 
 Windows has been tested locally; macOS and Linux need validation. Automatic CLI installation, forks, and manual compaction are not supported.

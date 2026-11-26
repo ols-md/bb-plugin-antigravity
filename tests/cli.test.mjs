@@ -8,7 +8,7 @@ import { readAntigravityProviderUsage } from '../usage.ts';
 
 test('Windows installer location works without agy on PATH for launch and usage', { skip: process.platform !== 'win32' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'agy-resolution-'));
-  const env = { ...process.env, PATH: root, LOCALAPPDATA: root };
+  const env = { ...process.env, PATH: root, USERPROFILE: root, LOCALAPPDATA: root };
   const command = join(root, 'agy', 'bin', 'agy.exe');
   try {
     assert.equal(resolveAntigravityCommand('agy', { env }), null);

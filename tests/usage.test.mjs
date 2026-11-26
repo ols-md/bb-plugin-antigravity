@@ -6,7 +6,7 @@ import {
   readAntigravityProviderUsage,
   registerAntigravityUsageSource,
 } from '../usage.ts';
-import { experimental_providerBridge } from '../host.ts';
+import { experimental_providerBridge } from './isolated-host.mjs';
 import { providerUsageResultSchema } from '@get-bb/plugin-sdk/provider-bridge';
 
 const SAMPLE_USAGE_JSON = JSON.stringify({

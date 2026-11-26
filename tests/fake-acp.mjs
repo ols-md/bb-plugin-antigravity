@@ -55,7 +55,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         },
       });
     }
-    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fake-session', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(m.result) } } } });
+    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fake-session', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(m.result) + (m.id === 100 ? '\nTask id "fake-session/task-1" finished with result: ok' : '') } } } });
     reply(promptId, { stopReason: 'end_turn' });
   }
 });

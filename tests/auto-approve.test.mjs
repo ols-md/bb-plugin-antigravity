@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rememberApprovalSetting, interceptApproval } from '../host.ts';
-import { rememberSubagentSetting } from '../subagents.ts';
+import { rememberApprovalSetting, interceptApproval } from './isolated-host.mjs';
+import { transformSubagentRequest } from '../subagents.ts';
 
 const options = (autoApprove, permissionEscalation = 'ask', extraProviderOptions = {}) => ({
   permissionMode: 'accept-edits', permissionScope: 'workspace', approvalReviewer: 'user', permissionEscalation,
@@ -9,7 +9,7 @@ const options = (autoApprove, permissionEscalation = 'ask', extraProviderOptions
 });
 function start(threadId, enabled, escalation, extraProviderOptions = {}) {
   const req = { method: 'thread/start', params: { threadId, cwd: process.cwd(), instructionMode: 'append', options: options(enabled, escalation, extraProviderOptions) } };
-  rememberSubagentSetting(JSON.stringify(req), req);
+  transformSubagentRequest(JSON.stringify(req), req);
   rememberApprovalSetting(req);
 }
 function request(threadId, payload, id = 1) {

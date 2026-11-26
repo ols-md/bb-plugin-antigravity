@@ -1,6 +1,6 @@
 ---
 name: antigravity-cli
-description: Spawn, configure, or troubleshoot Antigravity CLI (antigravity-cli) threads in BB — models, reasoning levels (low, medium, high), quota/usage windows, Build/Plan work modes, permissions, and sign-in.
+description: Spawn, configure, or troubleshoot Antigravity CLI (antigravity-cli) threads in BB — models, reasoning levels (low, medium, high, xhigh, max), quota/usage windows, Build/Plan work modes, permissions, and sign-in.
 ---
 
 # Antigravity CLI provider
@@ -9,7 +9,7 @@ Threads on the `antigravity-cli` provider run the locally installed Antigravity 
 
 ## Models and reasoning levels
 
-`antigravity-cli` discovers models and per-model reasoning efforts from the signed-in CLI (`low`, `medium`, `high`; default `medium`). Fixed-effort models (such as `gpt-oss-120b-medium`) report `supportedReasoningEfforts: []`.
+`antigravity-cli` discovers models and per-model reasoning efforts from the signed-in CLI (`low`, `medium`, `high`, `xhigh`, `max`, depending on the model). Fixed-effort models (such as `gpt-oss-120b-medium`) report `supportedReasoningEfforts: []`.
 
 - Plain `bb provider models antigravity-cli` prints only the model table and `sessionOptions` (`mode`), omitting reasoning levels. Always pass `--json` when inspecting reasoning support:
 
@@ -43,7 +43,7 @@ Work mode and permissions are separate controls:
 
 ## Requirements and settings
 
-- `agy` must be installed and on `PATH` on the target host (`agy --version`, `agy acp --help`).
+- `agy` must be installed on the target host, on `PATH` or in the standard installer location (`agy --version`, `agy acp --help`).
 - Sign in on the target host with `agy acp --login`.
 - Plugin settings (`Settings -> Installed plugins -> Antigravity CLI`):
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.

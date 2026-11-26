@@ -9,41 +9,12 @@
 <p align="center">
   <a href="#getting-started">Getting started</a> &middot;
   <a href="#modes-and-permissions">Modes & permissions</a> &middot;
-  <a href="SECURITY.md">Security</a> &middot;
-  <a href="docs/RELEASE.md">Marketplace submission</a>
+  <a href="SECURITY.md">Security</a>
 </p>
 
 An experimental community provider that connects [BB](https://getbb.app) to the [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli). Keep your existing CLI sign-in, choose available models, and work with streamed responses and tool approvals inside BB.
 
 **Status:** available in the BB Community marketplace and tested on Windows. macOS and Linux still need validation.
-
-## What you get
-
-- **One provider in BB:** select Antigravity CLI when creating a thread.
-- **Live model discovery:** models and reasoning options come from your CLI and account.
-- **Plan and Build:** plan a task, then switch back to implementation.
-- **Permission controls:** choose Accept edits or Full access.
-- **Background task & agent indicators:** see live composer and sidebar indicators when `run_command`, `schedule`, or native subagents run in the background. A turn stays running while the agent waits on non-daemon background work it started, so BB and parent threads are not told it finished early.
-- **BB agent delegation toggle:** optionally disable native Antigravity subagents so agents delegate work using BB threads (`bb thread spawn --parent-self`).
-- **Rich Antigravity tool cards:** view command summaries (`toolSummary`), clean command output with exit codes, destructive **Outside of sandbox** badges when `BypassSandbox` is used, and native subagent delegation cards.
-- **Native skills:** discover your workspace and personal Antigravity skills in BB.
-- **Usage & quota limits:** view per-model-group quota windows (`Gemini`, `Claude/GPT`, `Argon`) in BB's sidebar and usage settings.
-- **CLI sandbox setting:** request the CLI terminal sandbox for new threads.
-- **A settings toggle:** show or hide the provider without editing configuration files.
-
-## Preview
-
-<p align="center">
-  <img src="assets/screenshots/model-picker.png" width="281" alt="Antigravity model picker in BB, showing available models and Low, Medium, and High reasoning choices">
-</p>
-
-Choose a model and reasoning level from BB's conversation picker. Available models and options depend on your CLI version and account.
-
-<p align="center">
-  <img src="assets/screenshots/usage.png" width="380" alt="Antigravity CLI quota and usage windows in BB's sidebar usage panel">
-</p>
-
-Check your remaining quota per model group (`Gemini 7d`, `Gemini 5h`, `Claude/GPT 7d`, `Claude/GPT 5h`, `Argon 7d`) and reset countdowns in BB's sidebar usage popover or **Settings -> Usage limits**.
 
 ## Getting started
 
@@ -65,28 +36,6 @@ agy acp --login
 ```
 
 The plugin checks `PATH`, then the standard CLI installer location on the agent host (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows or `~/.local/bin/agy` on macOS/Linux). Remote agent hosts need their own CLI installation and sign-in.
-
-If PowerShell reports **`agy` is not recognized**, check the default installation:
-
-```powershell
-Test-Path "$env:LOCALAPPDATA\agy\bin\agy.exe"
-```
-
-If it returns `False`, install the standalone CLI using the [official installation instructions](https://antigravity.google/docs/getting-started?tab=cli):
-
-```powershell
-irm https://antigravity.google/cli/install.ps1 | iex
-```
-
-If it returns `True`, add its directory to the current terminal's PATH and verify:
-
-```powershell
-$env:Path += ";$env:LOCALAPPDATA\agy\bin"
-agy --version
-agy acp --login
-```
-
-For future terminals, add `%LOCALAPPDATA%\agy\bin` to your user **Path** in Windows Environment Variables, then reopen PowerShell and restart BB. The plugin fallback also works without this PATH change.
 
 ### 2. Install the plugin
 
@@ -115,6 +64,20 @@ Review and accept BB's installation prompt. Plugins run with full trust. The Git
 
 Select **Antigravity CLI** in BB's provider picker, choose a model, and send a prompt. The CLI supplies the available models; availability depends on your account and installed version.
 
+## Preview
+
+<p align="center">
+  <img src="assets/screenshots/model-picker.png" width="281" alt="Antigravity model picker in BB, showing available models and Low, Medium, and High reasoning choices">
+</p>
+
+Choose a model and reasoning level from BB's conversation picker. Available models and options depend on your CLI version and account.
+
+<p align="center">
+  <img src="assets/screenshots/usage.png" width="380" alt="Antigravity CLI quota and usage windows in BB's sidebar usage panel">
+</p>
+
+The percentage shows how much quota each group has used. The time at the right shows when its window resets. Open the sidebar or **Settings -> Usage limits**.
+
 ## How it works
 
 ```text
@@ -136,11 +99,11 @@ Planning and permissions are separate controls:
 | Permissions | Accept edits | Uses native Accept edits behavior; remaining ACP approval requests are presented in BB unless automatic approval is enabled. |
 | Permissions | Full access | BB's shared bridge automatically approves ACP permission requests. |
 
-Choose **Build** or **Plan** in the **Mode** selector. Build is the default. The CLI's combined Default / Accept edits / Plan selector is replaced by these two work modes, so editing permissions are no longer repeated there. The separate Plan action is removed. BB's Auto permission mode is unsupported by the shared ACP bridge.
+Choose **Build** or **Plan** in the **Mode** selector. Build is the default. The CLI's combined Default / Accept edits / Plan selector is replaced by these two work modes, so editing permissions are no longer repeated there. BB's Auto permission mode is unsupported by the shared ACP bridge.
 
 ### Terminal sandbox
 
-The plugin inherits the CLI's sandbox settings; it does not add `--sandbox` or force sandboxing off. Antigravity supports an OS-level terminal sandbox on supported systems. Its availability and boundaries depend on your OS, CLI version, and configuration. See [Antigravity's sandbox documentation](https://antigravity.google/docs/sandbox/?tab=cli).
+By default the plugin inherits the CLI's sandbox settings. Antigravity supports an OS-level terminal sandbox on supported systems. Its availability and boundaries depend on your OS, CLI version, and configuration. See [Antigravity's sandbox documentation](https://antigravity.google/docs/sandbox/?tab=cli).
 
 **Full access does not guarantee sandbox containment.** Even with the CLI sandbox enabled, a command can request execution outside it. Full access automatically approves ACP permission requests, potentially including those escape requests. Use Accept edits with automatic approval off to retain review of requests forwarded to BB.
 
@@ -148,7 +111,7 @@ Plan is agent behavior, not enforced read-only access. Permission approvals and 
 
 ## Settings
 
-Open **Settings -> Installed plugins -> Antigravity CLI** and use **Enable Antigravity CLI** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
+Open **Settings -> Installed plugins -> Antigravity CLI** and use **Show in provider picker** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
 
 The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. Off means inherit CLI settings, not force sandboxing off. Availability depends on the host OS.
 
@@ -170,18 +133,42 @@ Automatic CLI installation, conversation forking, manual compaction, and native 
 
 | Problem | What to check |
 | --- | --- |
-| Antigravity is missing | Enable the installed plugin and its **Enable Antigravity CLI** setting. |
-| `agy` cannot be found | Follow the PowerShell recovery steps above. Install the standalone CLI on the agent host; the plugin also checks its standard install location. |
+| Antigravity is missing | Enable the installed plugin and its **Show in provider picker** setting. |
+| `agy` cannot be found | See [Windows CLI recovery](#windows-cli-recovery). Install the standalone CLI on the agent host; the plugin also checks its standard install location. |
 | Sign-in is required or expired | Run `agy acp --login` on the agent host, then retry. |
 | ACP is unavailable | Update the CLI and confirm `agy acp --help` works. |
 | Model list is empty | Check CLI sign-in, connectivity, and account eligibility, then refresh providers. |
-| Commands run without asking | Check BB's permission selection and the CLI's own permission rules. Full access auto-approves ACP requests. |
+| Commands run without asking | Check automatic approval in plugin settings, BB's permission selection, and the CLI's own permission rules. Full access auto-approves ACP requests. |
 
 When reporting an issue, include BB/CLI versions and a short reproduction. Remove tokens, account details, private paths, and conversation content from logs.
 
+### Windows CLI recovery
+
+If PowerShell reports **`agy` is not recognized**, check the default installation:
+
+```powershell
+Test-Path "$env:LOCALAPPDATA\agy\bin\agy.exe"
+```
+
+If it returns `False`, install the standalone CLI using the [official installation instructions](https://antigravity.google/docs/getting-started?tab=cli):
+
+```powershell
+irm https://antigravity.google/cli/install.ps1 | iex
+```
+
+If it returns `True`, add its directory to the current terminal's PATH and verify:
+
+```powershell
+$env:Path += ";$env:LOCALAPPDATA\agy\bin"
+agy --version
+agy acp --login
+```
+
+For future terminals, add `%LOCALAPPDATA%\agy\bin` to your user **Path** in Windows Environment Variables, then reopen PowerShell and restart BB. The plugin fallback also works without this PATH change.
+
 ## Development
 
-The test runner requires Node.js 22.18+ or Node.js 24. The SDK dependency is pinned to 0.6.109.
+The test runner requires Node.js 22.18+ or Node.js 24.
 
 ```sh
 npm ci --ignore-scripts

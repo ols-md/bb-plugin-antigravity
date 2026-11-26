@@ -72,7 +72,6 @@ export function createSubagentController(options: { replyToBridge?: (line: strin
 }
 
 const defaultController = createSubagentController({ replyToBridge: line => queueMicrotask(() => experimental_acpProviderBridge.handleLine(line)) });
-export const rememberSubagentSetting = defaultController.rememberAndTransformRequest;
 export const transformSubagentRequest = defaultController.rememberAndTransformRequest;
 export const isSubagentsDisabled = defaultController.isSubagentsDisabled;
 export const isSubagentApprovalForDisabledThread = defaultController.isSubagentApprovalForDisabledThread;

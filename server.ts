@@ -12,16 +12,22 @@ const launchSpec = {
 export default async function antigravity(bb: BbPluginApi) {
   registerAntigravityUsageSource(bb);
   const settings = bb.settings.define({
+    enabled: {
+      type: "boolean",
+      label: "Show in provider picker",
+      description: "Active turns continue when you hide the provider.",
+      default: true,
+    },
     autoApprove: {
       type: "boolean",
       label: "Automatically approve ACP permission requests",
-      description: "Automatically answer Antigravity permission requests, including commands outside the CLI sandbox. Applies to new turns.",
+      description: "In Accept edits, approve requests on new turns, including commands outside the sandbox.",
       default: false,
     },
     sandbox: {
       type: "boolean",
       label: "Request CLI terminal sandbox",
-      description: "Add --sandbox for new threads. Otherwise use CLI settings. Requires a supported OS; the CLI may fall back to approval prompts. Full access can approve requests outside the sandbox.",
+      description: "Request sandboxing for new threads on supported hosts. Off inherits CLI settings. Full access can approve commands outside the sandbox.",
       default: false,
     },
     subagentsDisabled: {
@@ -34,12 +40,6 @@ export default async function antigravity(bb: BbPluginApi) {
       type: "boolean",
       label: "Show command descriptions",
       description: "Display Antigravity tool summaries on command execution cards.",
-      default: true,
-    },
-    enabled: {
-      type: "boolean",
-      label: "Enable Antigravity CLI",
-      description: "Show Antigravity in the provider picker. Existing running turns are not stopped.",
       default: true,
     },
   });
@@ -83,7 +83,7 @@ export default async function antigravity(bb: BbPluginApi) {
       supportsThreadArchive: false,
       supportsThreadRename: false,
       permissionModes: ["accept-edits", "full"],
-      reasoningLevels: ["low", "medium", "high"],
+      reasoningLevels: ["low", "medium", "high", "xhigh", "max"],
     },
     composerActions: [],
     models: { fallback: [], scope: "workspace" },

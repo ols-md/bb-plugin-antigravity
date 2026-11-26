@@ -164,18 +164,20 @@ test('thread/stop and thread/discard close a held turn as interrupted immediatel
   }
 });
 
-test('stop during an absorbed reactive turn drops the bridge\'s own boundary for it', t => {
-  const tr = tracker(t);
-  startBackgroundTurn(tr, 't', 'conv/task-1');
-  line(tr, 't', turnOpen(), agentText('Tests finished, summarising'));
-  const deltas = tr.handleInboundRequest({ method: 'thread/stop', params: { threadId: 't', intent: 'interrupt' } });
-  assert.equal(deltas.filter(d => d.kind === 'turn.boundary').length, 1);
-  // stopSession settles the agent turn with `cancelled`; BB's turn is already closed.
-  assert.deepEqual(line(tr, 't', boundary('interrupted')), []);
-  // The next real turn is unaffected.
-  assert.deepEqual(kinds(line(tr, 't', turnOpen())), ['turn.open']);
-  assert.deepEqual(kinds(line(tr, 't', boundary())), ['turn.boundary']);
-});
+for (const method of ['thread/stop', 'thread/discard']) {
+  test(`${method} during an absorbed turn drops the late boundary`, t => {
+    const tr = tracker(t);
+    startBackgroundTurn(tr, 't', 'conv/task-1');
+    line(tr, 't', turnOpen(), agentText('Tests finished, summarising'));
+    const deltas = tr.handleInboundRequest({ method, params: { threadId: 't', intent: 'interrupt' } });
+    assert.equal(deltas.filter(d => d.kind === 'turn.boundary').length, 1);
+    // stopSession settles the agent turn with `cancelled`; BB's turn is already closed.
+    assert.deepEqual(line(tr, 't', boundary('interrupted')), []);
+    // The next real turn is unaffected.
+    assert.deepEqual(kinds(line(tr, 't', turnOpen())), ['turn.open']);
+    assert.deepEqual(kinds(line(tr, 't', boundary())), ['turn.boundary']);
+  });
+}
 
 test('a new turn/start closes the held turn first; a turn/steer continues it', t => {
   const tr = tracker(t);
@@ -206,7 +208,7 @@ test('a new turn/start closes the held turn first; a turn/steer continues it', t
   assert.equal(tr.handleInbound({ ...steer, params: { ...steer.params, threadId: 'idle' } }).request.method, 'turn/steer');
 });
 
-test('a rejected steer prompt releases the held turn instead of waiting for the cap', t => {
+test('a rejected steer interrupts the held turn instead of waiting for the cap', t => {
   const tr = tracker(t);
   startBackgroundTurn(tr, 't', 'conv/task-1');
   const { request } = tr.handleInbound({ jsonrpc: '2.0', id: 'steer-7', method: 'turn/steer', params: { threadId: 't', input: [] } });
@@ -214,7 +216,7 @@ test('a rejected steer prompt releases the held turn instead of waiting for the 
   const rejection = JSON.stringify({ jsonrpc: '2.0', id: 'steer-7', error: { code: -32000, message: 'No active ACP session' } });
   const out = tr.processStdoutLine(rejection);
   assert.equal(out[0], rejection, 'the error still reaches BB');
-  assert.deepEqual(out.slice(1).flatMap(text => JSON.parse(text).params.deltas).map(d => [d.kind, d.status]), [['turn.boundary', 'completed']]);
+  assert.deepEqual(out.slice(1).flatMap(text => JSON.parse(text).params.deltas).map(d => [d.kind, d.status]), [['turn.boundary', 'interrupted']]);
   assert.equal(tr.isHoldingTurn('t'), false);
   // An accepted steer leaves the hold alone; unrelated responses pass through untouched.
   startBackgroundTurn(tr, 'u', 'conv/task-2');
@@ -226,14 +228,14 @@ test('a rejected steer prompt releases the held turn instead of waiting for the 
   assert.deepEqual(tr.processStdoutLine(other), [other]);
 });
 
-test('turn/start during an absorbed reactive turn closes BB\'s turn once and drops the agent turn boundary', t => {
+test('turn/start keeps the absorbed prompt attached until its bridge boundary', t => {
   const tr = tracker(t);
   startBackgroundTurn(tr, 't', 'conv/task-1');
   line(tr, 't', turnOpen());
   const { deltas } = tr.handleInbound({ method: 'turn/start', params: { threadId: 't' } });
-  assert.deepEqual(kinds(deltas), ['turn.boundary']);
-  // The bridge finishes its agent turn before starting the client turn.
-  assert.deepEqual(line(tr, 't', boundary()), []);
+  assert.deepEqual(deltas, []);
+  // Text remains attached until the SDK closes its agent turn.
+  assert.deepEqual(kinds(line(tr, 't', agentText('final detail'), boundary())), ['item.textDelta', 'turn.boundary']);
   assert.deepEqual(kinds(line(tr, 't', turnOpen())), ['turn.open']);
 });
 
@@ -248,13 +250,15 @@ test('the hold cap releases a turn whose work never finishes and exempts that wo
   assert.deepEqual(startBackgroundTurn(tr, 't', 'conv/task-2').filter(d => d.kind === 'turn.boundary'), []);
 });
 
-test('the cap releasing during an absorbed turn drops that turn\'s eventual boundary', async t => {
+test('the cap lets an active prompt finish streaming before it closes the turn', async t => {
   const tr = tracker(t, { maxTurnHoldMs: 20 });
   startBackgroundTurn(tr, 't', 'conv/task-1');
   line(tr, 't', turnOpen());
-  await until(() => tr.async.length > 0);
-  assert.equal(tr.async.flatMap(entry => entry.deltas).filter(d => d.kind === 'turn.boundary').length, 1);
-  assert.deepEqual(line(tr, 't', boundary()), []);
+  await sleep(60);
+  assert.deepEqual(tr.async, []);
+  assert.deepEqual(kinds(line(tr, 't', agentText('Still here'), sameKeyClose(backgroundCommand('conv/new')), boundary())),
+    ['item.textDelta', 'item.close', 'item.open', 'turn.boundary']);
+  assert.equal(tr.isHoldingTurn('t'), false);
 });
 
 test('provider errors that settle the turn end the hold without an extra boundary', async t => {

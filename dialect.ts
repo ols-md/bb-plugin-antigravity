@@ -646,7 +646,8 @@ export function classifyToolCall(event: AcpToolUpdateEvent): AcpDialectToolClass
       const useToolSummary =
         getCommandDescriptionsEnabled() &&
         typeof toolSummary === "string" &&
-        toolSummary.trim().length > 0;
+        toolSummary.trim().length > 0 &&
+        toolSummary.trim() !== commandLine?.trim();
 
       const presentation: DialectPresentation = {
         label: {

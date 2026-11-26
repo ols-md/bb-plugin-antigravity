@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, renameSync, rmdirSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText } from '../background-tasks.ts';
@@ -227,7 +227,10 @@ test('stream completion buffers span chunks, remain isolated, and flush at text 
     }
     assert.equal(stdout(tr, 'b', { kind: flush }).length, 1);
     const deltas = stdout(tr, 'a', { kind: flush });
-    assert.equal(deltas.at(-1).status, 'failed'); assert.equal(tr.getActiveTasks('b').length, 1);
+    const taskClose = deltas.find(delta => delta.kind === 'item.close');
+    assert.equal(taskClose.status, 'failed');
+    if (flush === 'turn.boundary') assert.equal(deltas.at(-1).kind, 'turn.boundary');
+    assert.equal(tr.getActiveTasks('b').length, 1);
     assert.equal(stdout(tr, 'a', { kind: flush }).length, 1);
     tr.clearThread('b');
   }
@@ -259,6 +262,60 @@ test('registration persists a versioned record and settling removes it', t => {
   const [close] = tr.inspectTextForCompletions('thread', 'Task id "task-42" finished with result: success');
   assert.equal(close.status, 'completed');
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+});
+
+test('a tracker leaves a handed-off thread alone when saving another thread', t => {
+  const path = statePath(t);
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('moved', command('old'));
+  first.clearThread('moved');
+  const second = tracker(t, { persistPath: path });
+  second.handleToolEventForThread('moved', command('new'));
+  first.handleToolEventForThread('other', command('keep'));
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId).sort(), ['keep', 'new']);
+});
+
+test('a successful save retries failed task changes and preserves a handoff', t => {
+  const path = statePath(t);
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('moved', command('old'));
+  renameSync(path, path + '.saved');
+  mkdirSync(path); // A directory at the target prevents the atomic rename.
+  first.clearThread('moved');
+  first.handleToolEventForThread('stays', command('retry-add'));
+  rmdirSync(path);
+  renameSync(path + '.saved', path);
+  const second = tracker(t, { persistPath: path });
+  second.handleToolEventForThread('moved', command('new'));
+  first.handleToolEventForThread('other', command('trigger'));
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId).sort(),
+    ['new', 'retry-add', 'trigger']);
+});
+
+test('a failed removal survives registration and removal of a replacement with the same task ID', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path });
+  tr.handleToolEventForThread('thread', command('same'));
+  renameSync(path, path + '.saved');
+  mkdirSync(path);
+  tr.clearThread('thread');
+  tr.handleToolEventForThread('thread', command('same', { toolCallId: 'replacement' }));
+  rmdirSync(path);
+  renameSync(path + '.saved', path);
+  tr.clearThread('thread');
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks, []);
+});
+
+test('reconciliation preserves a replacement registered in the same millisecond', t => {
+  t.mock.method(Date, 'now', () => 12345);
+  const path = statePath(t);
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('thread', command('same'));
+  const restarted = tracker(t, { persistPath: path });
+  first.clearThread('thread');
+  first.handleToolEventForThread('thread', command('same', { toolCallId: 'replacement' }));
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks[0].parentToolCallId, 'replacement');
 });
 
 test('simulated host restart emits interrupted close deltas on resume and drops the records', t => {
