@@ -357,6 +357,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     seq: number;
     refresh: boolean;
     invalidated: boolean;
+    superseded: boolean;
     promise: Promise<CachedObservation>;
   };
   type ActiveListSnapshot = {
@@ -378,16 +379,26 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
   const toResourceId = (hostId: string) => JSON.stringify([hostId, PROVIDER_ID]);
 
-  const invalidateInflight = (resourceId: string) => {
+  const invalidateInflight = (resourceId: string, sourceSeq: number) => {
     const entry = inflight.get(resourceId);
-    if (!entry) return;
+    if (!entry || entry.seq >= sourceSeq) return;
     entry.invalidated = true;
+    inflight.delete(resourceId);
+  };
+
+  const supersedeInflight = (resourceId: string, sourceSeq: number) => {
+    const entry = inflight.get(resourceId);
+    if (!entry || entry.seq >= sourceSeq) return;
+    entry.superseded = true;
     inflight.delete(resourceId);
   };
 
   const confirmResource = (resource: UsageResource, sourceSeq: number, listToken?: ActiveListSnapshot): boolean => {
     if (listToken?.invalidatedResources.has(resource.id)) return false;
-    knownResources.set(resource.id, resource);
+    if (!listToken?.protectedResources.has(resource.id)) {
+      knownResources.set(resource.id, resource);
+    }
+    supersedeInflight(resource.id, sourceSeq);
     for (const activeList of activeLists) {
       if (activeList !== listToken && activeList.seq < sourceSeq) {
         activeList.protectedResources.add(resource.id);
@@ -396,18 +407,20 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     return true;
   };
 
-  const evictResource = (resourceId: string) => {
+  const evictResource = (resourceId: string, sourceSeq: number) => {
     cache.delete(resourceId);
     knownResources.delete(resourceId);
-    invalidateInflight(resourceId);
+    invalidateInflight(resourceId, sourceSeq);
     for (const activeList of activeLists) {
-      activeList.invalidatedResources.add(resourceId);
+      if (activeList.seq < sourceSeq) {
+        activeList.invalidatedResources.add(resourceId);
+      }
     }
   };
 
-  const evictHost = (hostId: string) => {
+  const evictHost = (hostId: string, sourceSeq: number) => {
     for (const id of new Set([...cache.keys(), ...knownResources.keys(), toResourceId(hostId)])) {
-      if (resourceHostId(id) === hostId) evictResource(id);
+      if (resourceHostId(id) === hostId) evictResource(id, sourceSeq);
     }
   };
 
@@ -434,14 +447,14 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
   ): Promise<CachedObservation> => {
     const [hostId, providerId] = resourceIdTupleSchema.parse(JSON.parse(resourceId));
     if (providerId !== PROVIDER_ID) {
-      evictResource(resourceId);
+      evictResource(resourceId, entry.seq);
       throw new Error("Usage resource no longer exists.");
     }
-    const previous = cache.get(resourceId);
-    const unavailable = (message: string): CachedObservation =>
-      getResourceOutputSchema.parse({
-        accountKey: previous?.accountKey ?? null,
-        observedAt: previous?.observedAt ?? null,
+    const unavailable = (message: string): CachedObservation => {
+      const current = cache.get(resourceId);
+      return getResourceOutputSchema.parse({
+        accountKey: current?.accountKey ?? null,
+        observedAt: current?.observedAt ?? null,
         usage: {
           status: "error",
           accountEmail: null,
@@ -449,13 +462,17 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
           message,
         },
       });
+    };
 
     let host: Awaited<ReturnType<typeof bb.sdk.hosts.get>>;
     try {
       host = await bb.sdk.hosts.get({ hostId });
     } catch (error: unknown) {
+      if (entry.invalidated) {
+        throw new Error("Usage resource no longer exists.");
+      }
       if (isNotFoundError(error)) {
-        if (!entry.invalidated) evictHost(hostId);
+        if (!entry.superseded) evictHost(hostId, entry.seq);
         throw new Error("Usage resource no longer exists.");
       }
       return unavailable("Usage could not be collected from this machine.");
@@ -469,11 +486,13 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       return unavailable("Machine is disconnected.");
     }
 
-    const providerCheckSeq = ++requestSeq;
     let providers: Awaited<ReturnType<typeof bb.sdk.providers.list>>;
     try {
       providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
     } catch {
+      if (entry.invalidated) {
+        throw new Error("Usage resource no longer exists.");
+      }
       return unavailable("Usage inventory could not be loaded from this machine.");
     }
 
@@ -483,18 +502,21 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
     const matchedProvider = providers.find(isOwnedUsageProvider);
     if (!matchedProvider) {
-      evictResource(resourceId);
+      if (!entry.superseded) evictResource(resourceId, entry.seq);
       throw new Error("Usage resource no longer exists.");
     }
-    confirmResource(toUsageResource(host, matchedProvider.displayName), providerCheckSeq);
+    if (!entry.superseded) {
+      confirmResource(toUsageResource(host, matchedProvider.displayName), entry.seq);
+    }
 
+    const currentCached = cache.get(resourceId);
     if (
       !refresh &&
-      previous?.usage.status === "ok" &&
-      previous.observedAt !== null &&
-      Date.now() - previous.observedAt < USAGE_CACHE_TTL_MS
+      currentCached?.usage.status === "ok" &&
+      currentCached.observedAt !== null &&
+      Date.now() - currentCached.observedAt < USAGE_CACHE_TTL_MS
     ) {
-      return previous;
+      return currentCached;
     }
 
     let result: CachedObservation;
@@ -506,6 +528,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         throw new Error("Provider returned no usage information.");
       }
       rawStatus = rawUsage.status;
+      const previous = cache.get(resourceId);
       const rawRecord = rawUsage as Record<string, unknown>;
       result = getResourceOutputSchema.parse({
         accountKey: previous?.accountKey ?? null,
@@ -536,7 +559,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     if (entry.invalidated) {
       throw new Error("Usage resource no longer exists.");
     }
-    if (rawStatus !== "error" || previous?.usage.status !== "ok") {
+    if (rawStatus !== "error" || cache.get(resourceId)?.usage.status !== "ok") {
       cache.set(resourceId, result);
     }
     return result;
@@ -544,7 +567,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
   const collectResource = async (resourceId: string, refresh: boolean): Promise<CachedObservation> => {
     const existing = inflight.get(resourceId);
-    if (existing && !existing.invalidated) {
+    if (existing && !existing.invalidated && !existing.superseded) {
       if (!refresh || existing.refresh) return existing.promise;
       await existing.promise.catch(() => {});
       return collectResource(resourceId, refresh);
@@ -556,6 +579,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       seq: ++requestSeq,
       refresh,
       invalidated: false,
+      superseded: false,
       promise: undefined as unknown as Promise<CachedObservation>,
     };
     entry.promise = loadResource(resourceId, refresh, entry).finally(() => {
@@ -589,8 +613,8 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
             }
           }
           for (const entry of inflight.values()) {
-            if (entry.seq < snapshotSeq && !liveHostIds.has(entry.hostId)) {
-              invalidateInflight(entry.resourceId);
+            if (!liveHostIds.has(entry.hostId)) {
+              invalidateInflight(entry.resourceId, snapshotSeq);
             }
           }
 
@@ -634,18 +658,22 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
           for (const hostId of confirmedHostIds) {
             const expectedId = toResourceId(hostId);
-            if (!confirmedResourceIds.has(expectedId) && !listToken.protectedResources.has(expectedId)) {
-              evictResource(expectedId);
+            if (
+              !confirmedResourceIds.has(expectedId) &&
+              !listToken.protectedResources.has(expectedId) &&
+              !listToken.invalidatedResources.has(expectedId)
+            ) {
+              evictResource(expectedId, snapshotSeq);
             }
           }
 
           for (const cachedId of new Set([...cache.keys(), ...knownResources.keys()])) {
-            if (listToken.protectedResources.has(cachedId)) continue;
+            if (listToken.protectedResources.has(cachedId) || listToken.invalidatedResources.has(cachedId)) continue;
             const hostId = resourceHostId(cachedId);
             if (!hostId || !liveHostIds.has(hostId)) {
-              evictResource(cachedId);
+              evictResource(cachedId, snapshotSeq);
             } else if (confirmedHostIds.has(hostId) && !confirmedResourceIds.has(cachedId)) {
-              evictResource(cachedId);
+              evictResource(cachedId, snapshotSeq);
             }
           }
 

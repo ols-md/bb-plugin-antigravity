@@ -796,3 +796,249 @@ test('getResource after deletion and re-add does not join invalidated in-flight 
   finishSlowGet();
   await assert.rejects(firstGet, /no longer exists/);
 });
+
+test('older listResources eviction does not poison newer in-flight listResources or getResource', async () => {
+  let handlers;
+  let enabled = false;
+  let callIndex = 0;
+  let releaseOlder;
+  const olderStarted = new Promise(resolve => {
+    releaseOlder = resolve;
+  });
+  let finishOlder;
+  const olderGate = new Promise(resolve => {
+    finishOlder = resolve;
+  });
+  let releaseNewer;
+  let newerStartedCount = 0;
+  const newerStarted = new Promise(resolve => {
+    releaseNewer = resolve;
+  });
+  let finishNewer;
+  const newerGate = new Promise(resolve => {
+    finishNewer = resolve;
+  });
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [{ id: 'host_1', name: 'Primary Machine', status: 'connected' }],
+        get: async ({ hostId }) => ({ id: hostId, name: 'Primary Machine', status: 'connected' }),
+      },
+      providers: {
+        list: async () => {
+          callIndex++;
+          if (callIndex === 1) {
+            releaseOlder();
+            await olderGate;
+            return [];
+          }
+          newerStartedCount++;
+          if (newerStartedCount === 2) releaseNewer();
+          await newerGate;
+          return enabled ? [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }] : [];
+        },
+      },
+      system: {
+        usageLimits: async () => ({ 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage }),
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
+
+  const olderList = listResources({});
+  await olderStarted;
+
+  enabled = true;
+  const newerList = listResources({});
+  const newerGet = getResource({ resourceId: host1Id, refresh: true });
+  await newerStarted;
+
+  finishOlder();
+  const olderResult = await olderList;
+  assert.deepEqual(olderResult.resources, []);
+
+  finishNewer();
+  const [newerListResult, newerGetResult] = await Promise.all([newerList, newerGet]);
+  assert.deepEqual(newerListResult.resources.map(r => r.scope.hostId), ['host_1']);
+  assert.equal(newerGetResult.usage.status, 'ok');
+});
+
+test('stale getResource empty providers.list does not evict a resource confirmed by newer listResources', async () => {
+  let handlers;
+  let enabled = false;
+  let host1Status = 'connected';
+  let providerCalls = 0;
+  let releaseOldGet;
+  const oldGetStarted = new Promise(resolve => {
+    releaseOldGet = resolve;
+  });
+  let finishOldGet;
+  const oldGetGate = new Promise(resolve => {
+    finishOldGet = resolve;
+  });
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [{ id: 'host_1', name: 'Primary Machine', status: host1Status }],
+        get: async ({ hostId }) => ({ id: hostId, name: 'Primary Machine', status: host1Status }),
+      },
+      providers: {
+        list: async () => {
+          providerCalls++;
+          if (providerCalls === 1) {
+            releaseOldGet();
+            await oldGetGate;
+            return [];
+          }
+          return enabled ? [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }] : [];
+        },
+      },
+      system: {
+        usageLimits: async () => ({ 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage }),
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
+
+  const oldGet = getResource({ resourceId: host1Id, refresh: true });
+  await oldGetStarted;
+
+  enabled = true;
+  const newerList = await listResources({});
+  assert.deepEqual(newerList.resources.map(r => r.scope.hostId), ['host_1']);
+
+  // A getResource issued after newerList must not join the superseded oldGet.
+  const freshGet = await getResource({ resourceId: host1Id, refresh: true });
+  assert.equal(freshGet.usage.status, 'ok');
+
+  finishOldGet();
+  await assert.rejects(oldGet, /no longer exists/);
+
+  host1Status = 'disconnected';
+  const disconnectedList = await listResources({});
+  assert.deepEqual(disconnectedList.resources.map(r => r.scope.hostId), ['host_1']);
+});
+
+test('evicted getResource rejects instead of returning stale observedAt on provider lookup error', async () => {
+  let handlers;
+  let enabled = true;
+  let failNextProviderLookup = false;
+  let releaseSlowGet;
+  const slowGetStarted = new Promise(resolve => {
+    releaseSlowGet = resolve;
+  });
+  let finishSlowGet;
+  const slowGetGate = new Promise(resolve => {
+    finishSlowGet = resolve;
+  });
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [{ id: 'host_1', name: 'Primary Machine', status: 'connected' }],
+        get: async ({ hostId }) => ({ id: hostId, name: 'Primary Machine', status: 'connected' }),
+      },
+      providers: {
+        list: async () => {
+          if (failNextProviderLookup) {
+            failNextProviderLookup = false;
+            releaseSlowGet();
+            await slowGetGate;
+            throw new Error('Transient RPC failure');
+          }
+          return enabled ? [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }] : [];
+        },
+      },
+      system: {
+        usageLimits: async () => ({ 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage }),
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
+
+  const initial = await getResource({ resourceId: host1Id, refresh: true });
+  assert.equal(initial.usage.status, 'ok');
+  assert.ok(initial.observedAt !== null);
+
+  failNextProviderLookup = true;
+  const slowGet = getResource({ resourceId: host1Id, refresh: true });
+  await slowGetStarted;
+
+  enabled = false;
+  await listResources({});
+
+  finishSlowGet();
+  await assert.rejects(slowGet, /no longer exists/);
+});
+
+test('older listResources does not overwrite newer knownResources label', async () => {
+  let handlers;
+  let host1Status = 'connected';
+  let displayName = 'Old Label';
+  let providerCalls = 0;
+  let releaseOlder;
+  const olderStarted = new Promise(resolve => {
+    releaseOlder = resolve;
+  });
+  let finishOlder;
+  const olderGate = new Promise(resolve => {
+    finishOlder = resolve;
+  });
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [{ id: 'host_1', name: 'Primary Machine', status: host1Status }],
+      },
+      providers: {
+        list: async () => {
+          providerCalls++;
+          if (providerCalls === 1) {
+            releaseOlder();
+            await olderGate;
+            return [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Old Label' }];
+          }
+          return [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName }];
+        },
+      },
+      system: {
+        usageLimits: async () => ({ 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage }),
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+
+  const olderList = listResources({});
+  await olderStarted;
+
+  displayName = 'New Label';
+  const newerList = await listResources({});
+  assert.equal(newerList.resources[0].label, 'New Label');
+
+  finishOlder();
+  await olderList;
+
+  host1Status = 'disconnected';
+  const disconnectedList = await listResources({});
+  assert.equal(disconnectedList.resources[0].label, 'New Label');
+});
