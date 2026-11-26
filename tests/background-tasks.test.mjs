@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, renameSync, rmdirSync, writeFileSync, appendFileSync, rmSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, mkdirSync, renameSync, rmdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, readdirSync, utimesSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText } from '../background-tasks.ts';
+import { fileURLToPath } from 'node:url';
+import { createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText, withTaskStateLock } from '../background-tasks.ts';
 
 const command = (id = 'conv/task-1', extra = {}) => ({ toolCallId: `call:${id}`, title: 'run_command', status: 'completed', content: [{ type: 'text', text: `Tool is running as a background task with task id: ${id}\nTask Description: build\n` }], ...extra });
 const agent = (id = 'agent-1') => ({ toolCallId: `call:${id}`, title: 'invoke_subagent', status: 'completed', rawInput: { Role: 'Research' }, rawOutput: { conversationId: id } });
@@ -415,6 +418,307 @@ test('stale-record max age is configurable via taskStateMaxAgeMs', t => {
   const restarted = tracker(t, { persistPath: path, taskStateMaxAgeMs: 0 });
   assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 't' } }), []);
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+});
+
+const writerFixturePath = fileURLToPath(new URL('./task-state-writer-fixture.mjs', import.meta.url));
+
+function spawnWriter(t) {
+  const child = spawn(process.execPath, ['--experimental-strip-types', writerFixturePath], {
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    windowsHide: true,
+  });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += String(chunk); });
+  let nextId = 1;
+  const pending = new Map();
+  const listeners = new Map();
+  const ready = new Promise((resolve, reject) => {
+    const onMessage = msg => {
+      if (msg?.type === 'online') {
+        child.off('error', reject);
+        resolve(msg.pid);
+      }
+    };
+    child.on('message', onMessage);
+    child.once('error', reject);
+    child.once('exit', code => {
+      for (const { reject: fail } of pending.values()) fail(new Error(`writer exited (${code}): ${stderr}`));
+      pending.clear();
+      reject(new Error(`writer exited before ready (${code}): ${stderr}`));
+    });
+  });
+  child.on('message', msg => {
+    if (msg?.type === 'ack' && pending.has(msg.id)) {
+      const { resolve } = pending.get(msg.id);
+      pending.delete(msg.id);
+      resolve(msg);
+    } else if (msg?.type === 'error' && pending.has(msg.id)) {
+      const { reject } = pending.get(msg.id);
+      pending.delete(msg.id);
+      reject(new Error(msg.message));
+    } else if (msg?.type && listeners.has(msg.type)) {
+      const callbacks = listeners.get(msg.type);
+      listeners.delete(msg.type);
+      for (const cb of callbacks) cb(msg);
+    }
+  });
+  t.after(async () => {
+    if (child.exitCode === null && !child.killed) {
+      try { child.send({ type: 'exit' }); } catch {}
+      await new Promise(resolve => {
+        const timer = setTimeout(() => { try { child.kill(); } catch {} resolve(); }, 1000);
+        timer.unref();
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    }
+  });
+  return {
+    ready,
+    send(payload) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.send({ ...payload, id });
+      });
+    },
+    onceEvent(type) {
+      return new Promise(resolve => {
+        const list = listeners.get(type) ?? [];
+        list.push(resolve);
+        listeners.set(type, list);
+      });
+    },
+    killNow() {
+      if (child.exitCode !== null) return Promise.resolve();
+      const done = new Promise(resolve => child.once('exit', resolve));
+      child.kill('SIGKILL');
+      return done;
+    },
+    async close() {
+      if (child.exitCode !== null) return;
+      const done = new Promise(resolve => child.once('exit', resolve));
+      try { child.send({ type: 'exit' }); } catch {}
+      await done;
+    },
+  };
+}
+
+async function createDeadPid() {
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore', windowsHide: true });
+  const pid = child.pid;
+  await new Promise((resolve, reject) => {
+    child.once('exit', resolve);
+    child.once('error', reject);
+  });
+  return pid;
+}
+
+async function until(predicate, timeoutMs = 4_000, describe = () => 'condition not reached in time') {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.ok(predicate(), describe());
+}
+
+function readTaskPairs(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    if (parsed?.version !== 1 || !Array.isArray(parsed.tasks)) return null;
+    return parsed.tasks.map(task => `${task.threadId}:${task.taskId}`).sort();
+  } catch {
+    return null;
+  }
+}
+
+test('concurrent writer processes preserve all saved tasks and both threads recover after restart', async t => {
+  const path = statePath(t);
+  // Seed a legacy v1 record to confirm pre-existing data survives concurrent multi-host saves.
+  writeFileSync(path, `${JSON.stringify({
+    version: 1,
+    tasks: [{ threadId: 'legacy-thread', taskId: 'legacy-1', taskType: 'local_bash', description: 'legacy', parentToolCallId: 'call:legacy-1', startedAt: Date.now() }],
+  })}\n`);
+  const writerA = spawnWriter(t);
+  const writerB = spawnWriter(t);
+  await Promise.all([writerA.ready, writerB.ready]);
+  await Promise.all([
+    writerA.send({ type: 'init', persistPath: path }),
+    writerB.send({ type: 'init', persistPath: path }),
+  ]);
+
+  const rounds = 12;
+  for (let i = 0; i < rounds; i++) {
+    await Promise.all([
+      writerA.send({ type: 'register', threadId: 'thread-a', taskId: `a-task-${i}` }),
+      writerB.send({ type: 'register', threadId: 'thread-b', taskId: `b-task-${i}` }),
+    ]);
+    if (i % 3 === 0) {
+      await Promise.all([
+        writerA.send({ type: 'settle', threadId: 'thread-a', taskId: `a-task-${i}` }),
+        writerB.send({ type: 'settle', threadId: 'thread-b', taskId: `b-task-${i}` }),
+      ]);
+    }
+  }
+
+  const expectedA = Array.from({ length: rounds }, (_, i) => i).filter(i => i % 3 !== 0).map(i => `a-task-${i}`);
+  const expectedB = Array.from({ length: rounds }, (_, i) => i).filter(i => i % 3 !== 0).map(i => `b-task-${i}`);
+  const expectedPairs = [
+    'legacy-thread:legacy-1',
+    ...expectedA.map(id => `thread-a:${id}`),
+    ...expectedB.map(id => `thread-b:${id}`),
+  ].sort();
+  // Let any contended writers finish their scheduled async retries before simulated host exit.
+  await until(
+    () => JSON.stringify(readTaskPairs(path)) === JSON.stringify(expectedPairs),
+    4_000,
+    () => `expected ${JSON.stringify(expectedPairs)}, got ${JSON.stringify(readTaskPairs(path))}, locks=${JSON.stringify(readdirSync(`${path}.locks`))}`,
+  );
+  await Promise.all([writerA.close(), writerB.close()]);
+
+  const restarted = tracker(t, { persistPath: path });
+  const recoveredA = restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread-a' } });
+  const recoveredB = restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread-b' } });
+  const recoveredLegacy = restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'legacy-thread' } });
+
+  assert.deepEqual(recoveredA.map(d => d.key.providerItemId).sort(), expectedA.map(id => `task:${id}`).sort());
+  assert.deepEqual(recoveredB.map(d => d.key.providerItemId).sort(), expectedB.map(id => `task:${id}`).sort());
+  assert.deepEqual(recoveredLegacy.map(d => d.key.providerItemId), ['task:legacy-1']);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
+  assert.deepEqual(readdirSync(dirname(path)).filter(name => name.endsWith('.tmp')), []);
+  assert.deepEqual(readdirSync(`${path}.locks`), []);
+});
+
+test('a paused live writer is never evicted and a contended writer flushes via scheduled retry', async t => {
+  const path = statePath(t);
+  const holder = spawnWriter(t);
+  const waiter = spawnWriter(t);
+  await Promise.all([holder.ready, waiter.ready]);
+  await waiter.send({ type: 'init', persistPath: path });
+
+  const locked = holder.onceEvent('locked');
+  const holdPromise = holder.send({
+    type: 'holdLockAndWrite',
+    persistPath: path,
+    holdMs: 300,
+    threadId: 'thread-holder',
+    taskId: 'holder-task',
+  });
+  await locked;
+
+  const start = performance.now();
+  await waiter.send({ type: 'register', threadId: 'thread-waiter', taskId: 'waiter-task' });
+  const registerElapsed = performance.now() - start;
+  assert.ok(registerElapsed < 200, `contended registration should not block for the paused writer (elapsed ${registerElapsed.toFixed(1)}ms)`);
+
+  // While holder is still paused, its marker remains in <path>.locks and waiter has not overwritten the file.
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(existsSync(path), false, 'contended writer must not bypass the paused live writer');
+
+  const holdAck = await holdPromise;
+  assert.equal(holdAck.status, 'acquired');
+  // Without any further events, waiter's scheduled retry timer flushes its queued task onto holder's saved state.
+  await until(() => JSON.stringify(readTaskPairs(path)) === JSON.stringify(['thread-holder:holder-task', 'thread-waiter:waiter-task']));
+  await Promise.all([holder.close(), waiter.close()]);
+
+  const restarted = tracker(t, { persistPath: path });
+  assert.deepEqual(
+    restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread-holder' } }).map(d => d.key.providerItemId),
+    ['task:holder-task'],
+  );
+  assert.deepEqual(
+    restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread-waiter' } }).map(d => d.key.providerItemId),
+    ['task:waiter-task'],
+  );
+  assert.deepEqual(readdirSync(`${path}.locks`), []);
+});
+
+test('a crashed lock owner is pruned safely and racing writers both persist without losing records', async t => {
+  const path = statePath(t);
+  const lockDir = `${path}.locks`;
+  writeFileSync(path, `${JSON.stringify({
+    version: 1,
+    tasks: [{ threadId: 'legacy', taskId: 'survives', taskType: 'local_bash', description: 'keep', parentToolCallId: 'call:survives', startedAt: Date.now() }],
+  })}\n`);
+
+  // 1. Kill a real process mid-lock so it crashes leaving its unique marker behind.
+  const crashed = spawnWriter(t);
+  await crashed.ready;
+  const locked = crashed.onceEvent('locked');
+  const crashedRequest = crashed.send({
+    type: 'holdLockAndWrite',
+    persistPath: path,
+    holdMs: 30_000,
+    write: false,
+  });
+  crashedRequest.catch(() => {});
+  await locked;
+  assert.equal(readdirSync(lockDir).length, 1);
+  await crashed.killNow();
+  assert.equal(readdirSync(lockDir).length, 1, 'crashed process leaves its marker behind');
+
+  // 2. Also add a second dead-PID marker and race two independent writers to recover and save.
+  const deadPid = await createDeadPid();
+  writeFileSync(join(lockDir, `${deadPid}-${randomUUID()}.lock`), '');
+
+  const writerA = spawnWriter(t);
+  const writerB = spawnWriter(t);
+  await Promise.all([writerA.ready, writerB.ready]);
+  await Promise.all([
+    writerA.send({ type: 'init', persistPath: path }),
+    writerB.send({ type: 'init', persistPath: path }),
+  ]);
+  await Promise.all([
+    writerA.send({ type: 'register', threadId: 'a', taskId: 'from-a' }),
+    writerB.send({ type: 'register', threadId: 'b', taskId: 'from-b' }),
+  ]);
+  await until(() => JSON.stringify(readTaskPairs(path)) === JSON.stringify(['a:from-a', 'b:from-b', 'legacy:survives']));
+  await Promise.all([writerA.close(), writerB.close()]);
+  assert.deepEqual(readdirSync(lockDir), []);
+});
+
+test('concurrent startup GC with a live writer preserves new and fresh legacy tasks', async t => {
+  const path = statePath(t);
+  writeFileSync(path, `${JSON.stringify({
+    version: 1,
+    tasks: [
+      { threadId: 'stale', taskId: 'old', taskType: 'local_bash', description: 'old', parentToolCallId: 'call:old', startedAt: Date.now() - 10 * 24 * 60 * 60 * 1000 },
+      { threadId: 'legacy', taskId: 'fresh', taskType: 'local_bash', description: 'fresh', parentToolCallId: 'call:fresh', startedAt: Date.now() - 60_000 },
+    ],
+  })}\n`);
+  // Stray crash temp file beside background-tasks.json must not interfere with recovery.
+  writeFileSync(`${path}.99999.dead.tmp`, '{"version":1,"tasks":[');
+
+  const liveWriter = spawnWriter(t);
+  const starter = spawnWriter(t);
+  await Promise.all([liveWriter.ready, starter.ready]);
+  await liveWriter.send({ type: 'init', persistPath: path });
+  await Promise.all([
+    liveWriter.send({ type: 'register', threadId: 'live', taskId: 'brand-new' }),
+    starter.send({ type: 'init', persistPath: path }),
+  ]);
+  await until(() => JSON.stringify(readTaskPairs(path)) === JSON.stringify(['legacy:fresh', 'live:brand-new']));
+  await Promise.all([liveWriter.close(), starter.close()]);
+  assert.deepEqual(readdirSync(`${path}.locks`), []);
+});
+
+test('live lock markers are never evicted by age and yielding removes only the caller marker', t => {
+  const path = statePath(t);
+  const lockDir = `${path}.locks`;
+  mkdirSync(lockDir, { recursive: true });
+  const liveMarker = join(lockDir, `${process.pid}-${randomUUID()}.lock`);
+  writeFileSync(liveMarker, '');
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  utimesSync(liveMarker, hourAgo, hourAgo);
+
+  // Even an hour-old marker owned by a live PID must not be evicted; the contender yields and removes only its own marker.
+  assert.deepEqual(withTaskStateLock(path, () => 'should-not-run'), { status: 'contended' });
+  assert.deepEqual(readdirSync(lockDir), [liveMarker.split(/[\\/]/).pop()]);
+
+  // Once the live owner removes its marker, acquisition succeeds and cleans up its marker on exit.
+  unlinkSync(liveMarker);
+  assert.deepEqual(withTaskStateLock(path, () => 'acquired-ok'), { status: 'acquired', value: 'acquired-ok' });
+  assert.deepEqual(readdirSync(lockDir), []);
 });
 
 // Silent turn detection: a turn that ends with a failed command with empty output and no

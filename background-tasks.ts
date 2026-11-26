@@ -1,4 +1,5 @@
-import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { StringDecoder } from 'node:string_decoder';
@@ -212,23 +213,129 @@ export function defaultBackgroundTaskStatePath(): string {
   return join(dir, 'background-tasks.json');
 }
 
+const LOCK_MARKER_PATTERN = /^(\d+)-[0-9a-f-]+\.lock$/i;
+const LOCK_RETRY_BASE_MS = 10;
+const LOCK_RETRY_MAX_MS = 500;
+const TRANSIENT_IO_MAX_RETRIES = 20;
+
+function isTransientFsError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+function isDirectoryPath(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isPidDefinitivelyDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+function unlinkUniqueMarker(markerPath: string, attempt = 0): void {
+  try {
+    unlinkSync(markerPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    if (isTransientFsError(error) && attempt < 10) {
+      const timer = setTimeout(() => unlinkUniqueMarker(markerPath, attempt + 1), 10);
+      timer.unref?.();
+    }
+  }
+}
+
+/**
+ * Non-blocking cross-process lock around `background-tasks.json` using unique per-attempt
+ * markers in `<path>.locks/`. Each attempt creates `<pid>-<uuid>.lock` with `wx`, enumerates
+ * all markers before the critical section, prunes only definitively dead PIDs (`ESRCH`), and
+ * yields (removing only its own unique marker) if any other live contender exists. Live writers
+ * are never evicted by age, and unique marker names prevent shared-filename unlink races.
+ */
+export function withTaskStateLock<T>(
+  path: string,
+  fn: () => T,
+): { status: 'acquired'; value: T } | { status: 'contended' | 'error' } {
+  if (!path) return { status: 'error' };
+  const lockDir = `${path}.locks`;
+  const markerName = `${process.pid}-${randomUUID()}.lock`;
+  const markerPath = join(lockDir, markerName);
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    const fd = openSync(markerPath, 'wx');
+    closeSync(fd);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EBUSY' ? { status: 'contended' } : { status: 'error' };
+  }
+  let entries: string[];
+  try {
+    entries = readdirSync(lockDir);
+  } catch (error) {
+    unlinkUniqueMarker(markerPath);
+    return (error as NodeJS.ErrnoException).code === 'EBUSY' ? { status: 'contended' } : { status: 'error' };
+  }
+  for (const entry of entries) {
+    if (entry === markerName) continue;
+    const match = LOCK_MARKER_PATTERN.exec(entry);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (isPidDefinitivelyDead(pid)) {
+      try { unlinkSync(join(lockDir, entry)); } catch {}
+      continue;
+    }
+    unlinkUniqueMarker(markerPath);
+    return { status: 'contended' };
+  }
+  try {
+    return { status: 'acquired', value: fn() };
+  } finally {
+    unlinkUniqueMarker(markerPath);
+  }
+}
+
+interface LoadedTaskState {
+  tasks: PersistedBackgroundTask[];
+  needsWrite: boolean;
+  ioError: 'none' | 'transient' | 'fatal';
+}
+
 /** Loads and validates the state file. Missing or corrupt files degrade to an empty list. */
-function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[] {
-  if (!path) return [];
+function loadTaskState(path: string, maxAgeMs: number): LoadedTaskState {
+  if (!path) return { tasks: [], needsWrite: false, ioError: 'none' };
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { tasks: [], needsWrite: false, ioError: 'none' };
+    return { tasks: [], needsWrite: false, ioError: isTransientFsError(error) && !isDirectoryPath(path) ? 'transient' : 'fatal' };
+  }
   let parsed: unknown;
-  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return []; }
-  if (!parsed || typeof parsed !== 'object') return [];
+  try { parsed = JSON.parse(raw); } catch { return { tasks: [], needsWrite: true, ioError: 'none' }; }
+  if (!parsed || typeof parsed !== 'object') return { tasks: [], needsWrite: true, ioError: 'none' };
   const file = parsed as { version?: unknown; tasks?: unknown };
-  if (file.version !== 1 || !Array.isArray(file.tasks)) return [];
+  if (file.version !== 1 || !Array.isArray(file.tasks)) return { tasks: [], needsWrite: true, ioError: 'none' };
   const cutoff = Date.now() - Math.max(0, maxAgeMs); // Garbage-collect stale records.
   const records: PersistedBackgroundTask[] = [];
+  let pruned = false;
   for (const entry of file.tasks) {
-    if (!entry || typeof entry !== 'object') continue;
+    if (!entry || typeof entry !== 'object') { pruned = true; continue; }
     const task = entry as Partial<PersistedBackgroundTask>;
     if (typeof task.threadId !== 'string' || typeof task.taskId !== 'string' || typeof task.description !== 'string' ||
         typeof task.parentToolCallId !== 'string' || typeof task.startedAt !== 'number' ||
         !Number.isFinite(task.startedAt) || task.startedAt < cutoff ||
-        (task.taskType !== 'local_bash' && task.taskType !== 'local_subagent')) continue;
+        (task.taskType !== 'local_bash' && task.taskType !== 'local_subagent')) {
+      pruned = true;
+      continue;
+    }
     records.push({
       threadId: task.threadId, taskId: task.taskId, taskType: task.taskType, description: task.description,
       parentToolCallId: task.parentToolCallId, startedAt: task.startedAt,
@@ -236,21 +343,24 @@ function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[
       ...(typeof task.outputFile === 'string' ? { outputFile: task.outputFile } : {}),
     });
   }
-  return records;
+  return { tasks: records, needsWrite: pruned, ioError: 'none' };
 }
 
 /** Atomic-ish write: temp file + rename, so a crash mid-write can never corrupt the state file. */
-function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean {
+function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): 'saved' | 'transient' | 'failed' {
+  let temp: string | undefined;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    const temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
     writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
     renameSync(temp, path);
-    return true;
-  } catch {
+    temp = undefined;
+    return 'saved';
+  } catch (error) {
     // Best effort: persistence trouble (missing dir permissions, full disk, ...) must never
     // crash the plugin host. Keep pending changes for the next save.
-    return false;
+    if (temp) { try { unlinkSync(temp); } catch {} }
+    return isTransientFsError(error) && !isDirectoryPath(path) ? 'transient' : 'failed';
   }
 }
 
@@ -369,16 +479,34 @@ export function createBackgroundTaskTracker(options: {
   });
   const recordKey = (record: PersistedBackgroundTask) => JSON.stringify([record.threadId, taskKey(record)]);
   const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean }>();
-  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
-    if (!persistPath) return;
+  let persistRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let persistRetryAttempt = 0;
+  let startupGcPending = false;
+  function clearPersistRetry() {
+    if (persistRetryTimer) { clearTimeout(persistRetryTimer); persistRetryTimer = undefined; }
+    persistRetryAttempt = 0;
+  }
+  function schedulePersistRetry() {
+    if (disposed || !persistPath || persistRetryTimer) return;
+    const base = Math.min(LOCK_RETRY_MAX_MS, LOCK_RETRY_BASE_MS * (2 ** Math.min(persistRetryAttempt, 6)));
+    const delay = base + Math.floor(Math.random() * base);
+    persistRetryAttempt += 1;
+    persistRetryTimer = setTimeout(() => {
+      persistRetryTimer = undefined;
+      flushPendingWrites();
+    }, delay);
+    persistRetryTimer.unref?.();
+  }
+  function queuePendingWrites(thread: string, tasks: BackgroundTask[], remove: boolean) {
     for (const task of tasks) {
       const record = toRecord(thread, task);
       const key = recordKey(record);
       pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove });
       initialRecords.delete(key);
     }
-    if (!pendingWrites.size) return;
-    const records = new Map(readTaskState(persistPath, maxAge).map(record => [recordKey(record), record]));
+  }
+  function applyPendingWrites(loadedTasks: PersistedBackgroundTask[]): PersistedBackgroundTask[] {
+    const records = new Map(loadedTasks.map(record => [recordKey(record), record]));
     for (const change of pendingWrites.values()) {
       const key = recordKey(change.record);
       const existing = records.get(key);
@@ -388,7 +516,44 @@ export function createBackgroundTaskTracker(options: {
         records.set(key, change.record);
       }
     }
-    if (writeTaskState(persistPath, [...records.values()])) pendingWrites.clear();
+    return [...records.values()];
+  }
+  function flushPendingWrites() {
+    if (disposed || !persistPath || (!pendingWrites.size && !startupGcPending)) { clearPersistRetry(); return; }
+    const locked = withTaskStateLock(persistPath, () => {
+      const loaded = loadTaskState(persistPath, maxAge);
+      if (loaded.ioError !== 'none') return loaded.ioError === 'transient' ? 'transient' as const : 'failed' as const;
+      if (pendingWrites.size) {
+        const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks));
+        if (result !== 'saved') return result;
+        pendingWrites.clear();
+        startupGcPending = false;
+        return 'saved' as const;
+      }
+      if (startupGcPending) {
+        if (loaded.needsWrite) {
+          const result = writeTaskState(persistPath, loaded.tasks);
+          if (result !== 'saved') return result;
+        }
+        startupGcPending = false;
+      }
+      return 'saved' as const;
+    });
+    if (locked.status === 'contended') {
+      schedulePersistRetry();
+      return;
+    }
+    if (locked.status === 'acquired') {
+      if (locked.value === 'saved') clearPersistRetry();
+      else if (locked.value === 'transient' && persistRetryAttempt < TRANSIENT_IO_MAX_RETRIES) schedulePersistRetry();
+    }
+  }
+  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
+    if (!persistPath) return;
+    queuePendingWrites(thread, tasks, remove);
+    if (!pendingWrites.size) return;
+    persistRetryAttempt = 0;
+    flushPendingWrites();
   }
   /**
    * Restart reconciliation: `clearThread`-shaped `interrupted` closes for persisted tasks of a
@@ -397,20 +562,51 @@ export function createBackgroundTaskTracker(options: {
    */
   function reconcilePersisted(thread: string): BackgroundTaskDelta[] {
     if (!persistPath) return [];
-    const records = readTaskState(persistPath, maxAge);
+    const hasInitialForThread = [...initialRecords.values()].some(record => record.threadId === thread);
+    if (!hasInitialForThread) return [];
     const active = threads.get(thread);
-    const pending = records.filter(record => {
+    const matching = (records: PersistedBackgroundTask[]) => records.filter(record => {
       const initial = initialRecords.get(recordKey(record));
       return record.threadId === thread && !active?.has(taskKey(record)) &&
         initial?.startedAt === record.startedAt && initial.parentToolCallId === record.parentToolCallId;
     });
+    let pending: PersistedBackgroundTask[] = [];
+    const locked = withTaskStateLock(persistPath, () => {
+      const loaded = loadTaskState(persistPath, maxAge);
+      if (loaded.ioError !== 'none') return loaded.ioError;
+      pending = matching(loaded.tasks);
+      if (!pending.length) return 'none' as const;
+      queuePendingWrites(thread, pending, true);
+      const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks));
+      if (result === 'saved') {
+        pendingWrites.clear();
+        startupGcPending = false;
+        clearPersistRetry();
+        return 'none' as const;
+      }
+      return result === 'transient' ? 'transient' as const : 'fatal' as const;
+    });
+    if (locked.status === 'acquired' && locked.value === 'transient') {
+      persistRetryAttempt = 0;
+      schedulePersistRetry();
+    } else if (locked.status !== 'acquired') {
+      const loaded = loadTaskState(persistPath, maxAge);
+      if (loaded.ioError === 'none') {
+        pending = matching(loaded.tasks);
+        if (pending.length) {
+          queuePendingWrites(thread, pending, true);
+          if (locked.status === 'contended') {
+            persistRetryAttempt = 0;
+            schedulePersistRetry();
+          }
+        }
+      }
+    }
     if (!pending.length) return [];
-    const results = pending.map(record => delta({
+    return pending.map(record => delta({
       taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
       ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
     }, 'interrupted', 'stopped'));
-    persistTasks(thread, pending, true);
-    return results;
   }
   function syncPolling() {
     for (const [thread, paths] of watchers) {
@@ -885,9 +1081,22 @@ export function createBackgroundTaskTracker(options: {
   // next resume must still report the tasks as interrupted.
   const initialRecords = new Map<string, PersistedBackgroundTask>();
   if (persistPath) {
-    const records = readTaskState(persistPath, maxAge);
-    for (const record of records) initialRecords.set(recordKey(record), record);
-    writeTaskState(persistPath, records);
+    let gcNeedsRetry = false;
+    const locked = withTaskStateLock(persistPath, () => {
+      const state = loadTaskState(persistPath, maxAge);
+      if (state.ioError === 'none' && state.needsWrite) {
+        if (writeTaskState(persistPath, state.tasks) === 'transient') gcNeedsRetry = true;
+      } else if (state.ioError === 'transient') {
+        gcNeedsRetry = true;
+      }
+      return state;
+    });
+    const state = locked.status === 'acquired' ? locked.value : loadTaskState(persistPath, maxAge);
+    for (const record of state.tasks) initialRecords.set(recordKey(record), record);
+    if (gcNeedsRetry || (locked.status === 'contended' && (state.ioError === 'transient' || (state.ioError === 'none' && state.needsWrite)))) {
+      startupGcPending = true;
+      schedulePersistRetry();
+    }
   }
   function retainThreadTool(thread: string, id: string, event: RecordedToolEvent) {
     const compacted = compactToolEvent(event, maxToolOutputChars);
@@ -1064,6 +1273,7 @@ export function createBackgroundTaskTracker(options: {
     isHoldingTurn(thread: string): boolean { return holds.get(thread)?.boundary !== undefined; },
     dispose() {
       disposed = true;
+      clearPersistRetry();
       for (const hold of holds.values()) clearHoldTimers(hold);
       holds.clear(); threads.clear(); pending.clear(); pendingCount = 0; threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear();
       if (timer) { clearInterval(timer); timer = undefined; }
