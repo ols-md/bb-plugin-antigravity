@@ -318,6 +318,21 @@ test('reconciliation preserves a replacement registered in the same millisecond'
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks[0].parentToolCallId, 'replacement');
 });
 
+test('a delayed addition retry preserves a same-millisecond replacement from another tracker', t => {
+  t.mock.method(Date, 'now', () => 12345);
+  const path = statePath(t);
+  mkdirSync(path); // Force the first tracker's write to fail so its addition stays queued.
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('thread', command('same'));
+  rmdirSync(path);
+  const second = tracker(t, { persistPath: path });
+  second.handleToolEventForThread('thread', command('same', { toolCallId: 'replacement' }));
+  first.handleToolEventForThread('other', command('trigger'));
+  const tasks = JSON.parse(readFileSync(path, 'utf8')).tasks;
+  assert.deepEqual(tasks.map(task => task.taskId).sort(), ['same', 'trigger']);
+  assert.equal(tasks.find(task => task.taskId === 'same').parentToolCallId, 'replacement');
+});
+
 test('simulated host restart emits interrupted close deltas on resume and drops the records', t => {
   const path = statePath(t);
   const first = tracker(t, { persistPath: path });

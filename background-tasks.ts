@@ -272,7 +272,7 @@ export function createBackgroundTaskTracker(options: {
       const existing = records.get(key);
       if (change.remove) {
         if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
-      } else if (!existing || existing.startedAt <= change.record.startedAt) {
+      } else if (!existing || existing.startedAt < change.record.startedAt) {
         records.set(key, change.record);
       }
     }
