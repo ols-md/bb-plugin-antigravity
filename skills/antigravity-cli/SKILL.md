@@ -64,5 +64,6 @@ bb settings usage --refresh --json
 
 ## Limits
 
-- Session fork/rewind (`fork: "none"`), manual `/compact`, service tiers, and native thread archive/rename are not supported.
+- Run `bb thread compact` on an idle thread with conversation history. The plugin checks the session transcript for a new checkpoint.
+- Session fork/rewind (`fork: "none"`), service tiers, and native thread archive/rename are not supported.
 - Native skills are indexed from workspace `.agents/skills` and `.agent/skills`, and from user `~/.gemini/antigravity-cli/skills`, `~/.gemini/skills`, and `~/.gemini/config/skills`.

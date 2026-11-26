@@ -79,7 +79,7 @@ export default async function antigravity(bb: BbPluginApi) {
       supportsServiceTier: false,
       supportsNativeUserQuestion: false,
       fork: "none",
-      supportsManualCompaction: false,
+      supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
       permissionModes: ["accept-edits", "full"],

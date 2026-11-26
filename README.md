@@ -129,7 +129,9 @@ The plugin stores these boolean preferences. BB and the CLI can retain their nor
 
 See the [capability comparison](docs/FEATURES.md) for verified features and remaining gaps.
 
-Automatic CLI installation, conversation forking, manual compaction, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
+Use `/compact` after a conversation turn to reduce its context. BB confirms completion from the new checkpoint in the local Antigravity transcript.
+
+Automatic CLI installation, conversation forking, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
 
 ## Troubleshooting
 
