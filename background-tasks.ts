@@ -6,12 +6,16 @@ import { inferAntigravityToolName } from './dialect.ts';
 
 export interface RecordedToolEvent {
   toolCallId: string;
+  name?: string;
   title?: string;
   kind?: string;
   status?: string;
   rawInput?: Record<string, unknown>;
   rawOutput?: unknown;
   content?: unknown;
+}
+interface RetainedToolEvent extends RecordedToolEvent {
+  outputTruncated?: boolean;
 }
 export interface BackgroundTask {
   taskId: string;
@@ -68,7 +72,26 @@ export type TrackerDelta = BackgroundTaskDelta | SilentTurnInjectionDelta | Turn
 export const DEFAULT_HOLD_SETTLE_GRACE_MS = 20_000;
 /** Default upper bound on how long one turn can be held open for background work. */
 export const DEFAULT_MAX_TURN_HOLD_MS = 5 * 60 * 1000;
+/** Default maximum bytes read from one transcript watcher in a single poll slice. */
+export const DEFAULT_MAX_TRANSCRIPT_READ_BYTES = 64 * 1024;
+/** Default maximum characters buffered for one transcript line before bounded streaming scan. */
+export const DEFAULT_MAX_TRANSCRIPT_LINE_CHARS = 128 * 1024;
+/** Default maximum characters retained for tool output and task completion summaries. */
+export const DEFAULT_MAX_RETAINED_TOOL_OUTPUT_CHARS = 16 * 1024;
+/** Default maximum in-flight tool records retained per thread. */
+export const DEFAULT_MAX_RETAINED_TOOLS_PER_THREAD = 256;
+/** Default maximum unconsumed tool events retained in the pending correlation queue. */
+export const DEFAULT_MAX_PENDING_TOOL_EVENTS = 512;
+/** Default maximum characters buffered per thread for streamed text completion scanning. */
+export const DEFAULT_MAX_STREAM_BUFFER_CHARS = 64 * 1024;
+const MAX_RETAINED_INPUT_STRING_CHARS = 2048;
+const MAX_RETAINED_CONVERSATION_IDS = 256;
+const MAX_COMPLETION_OVERLAP_CHARS = 4096;
+const RETAINED_INPUT_STRING_KEYS = [
+  'Action', 'TaskId', 'Role', 'TypeName', 'toolSummary', 'CommandLine', 'command', 'Prompt', 'CronExpression',
+] as const;
 const TERMINAL_TOOL_STATUS = /^(?:completed|failed|cancell?ed)$/;
+const COMPLETION_HINT = /Task id|Subagent/i;
 // After this many consecutive silent turns (failed empty-output command, no agent text),
 // the injected message escalates to "command execution appears broken in this session".
 export const SILENT_TURN_ESCALATION_THRESHOLD = 2;
@@ -99,15 +122,81 @@ function containsTaskToken(text: string, token: string): boolean {
   return new RegExp(`(?<![A-Za-z0-9_/-])${escaped}(?![A-Za-z0-9_/-])`).test(text);
 }
 
-function mergeToolEvent(previous: RecordedToolEvent | undefined, event: RecordedToolEvent): RecordedToolEvent {
+function boundText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const marker = '\n...[truncated]...\n';
+  if (maxChars <= marker.length + 2) return text.slice(0, maxChars);
+  const budget = maxChars - marker.length;
+  let head = Math.ceil(budget / 2);
+  let tailStart = text.length - (budget - head);
+  if (head > 0 && text.charCodeAt(head - 1) >= 0xd800 && text.charCodeAt(head - 1) <= 0xdbff) head -= 1;
+  if (tailStart < text.length && text.charCodeAt(tailStart) >= 0xdc00 && text.charCodeAt(tailStart) <= 0xdfff) tailStart += 1;
+  return `${text.slice(0, head)}${marker}${text.slice(tailStart)}`;
+}
+
+function unescapeOversizedText(raw: string): string {
+  return raw
+    .replace(/\\(["nrt\\])/g, (_, ch: string) => ch === 'n' ? '\n' : ch === 'r' ? '\r' : ch === 't' ? '\t' : ch)
+    .replace(/\\"/g, '"');
+}
+
+function compactRawInput(rawInput: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) return undefined;
+  const compact: Record<string, unknown> = {};
+  for (const key of RETAINED_INPUT_STRING_KEYS) {
+    const value = rawInput[key];
+    if (typeof value === 'string') compact[key] = boundText(value, MAX_RETAINED_INPUT_STRING_CHARS);
+  }
+  if (typeof rawInput.IsDaemon === 'boolean' || typeof rawInput.IsDaemon === 'string') compact.IsDaemon = rawInput.IsDaemon;
+  if (typeof rawInput.DurationSeconds === 'number' && Number.isFinite(rawInput.DurationSeconds)) compact.DurationSeconds = rawInput.DurationSeconds;
+  if (Array.isArray(rawInput.ConversationIds)) {
+    compact.ConversationIds = rawInput.ConversationIds
+      .filter((item): item is string => typeof item === 'string')
+      .slice(0, MAX_RETAINED_CONVERSATION_IDS)
+      .map(item => boundText(item, MAX_RETAINED_INPUT_STRING_CHARS));
+  }
+  return Object.keys(compact).length ? compact : undefined;
+}
+
+function compactToolEvent(event: RecordedToolEvent, maxOutputChars: number): RetainedToolEvent {
+  const inferred = inferAntigravityToolName(event as any) ?? undefined;
+  const hasOutput = event.content !== undefined || event.rawOutput !== undefined;
+  const extracted = hasOutput ? extractToolOutputText(event) : undefined;
+  const outputTruncated = Boolean((event as RetainedToolEvent).outputTruncated || (extracted !== undefined && extracted.length > maxOutputChars));
+  const boundedContent = extracted !== undefined ? boundText(extracted, maxOutputChars) : undefined;
+  let compactOutput: unknown = undefined;
+  if (Array.isArray(event.rawOutput) && event.rawOutput.length === 0) {
+    compactOutput = [];
+  } else if (event.rawOutput && typeof event.rawOutput === 'object' && !Array.isArray(event.rawOutput)) {
+    const conversationId = (event.rawOutput as Record<string, unknown>).conversationId;
+    if (typeof conversationId === 'string') compactOutput = { conversationId: boundText(conversationId, MAX_RETAINED_INPUT_STRING_CHARS) };
+  }
+  const rawInput = compactRawInput(event.rawInput);
+  return {
+    toolCallId: event.toolCallId,
+    ...(inferred ? { name: inferred } : typeof event.name === 'string' ? { name: boundText(event.name, MAX_RETAINED_INPUT_STRING_CHARS) } : {}),
+    ...(typeof event.title === 'string' ? { title: boundText(event.title, MAX_RETAINED_INPUT_STRING_CHARS) } : {}),
+    ...(typeof event.kind === 'string' ? { kind: event.kind } : {}),
+    ...(typeof event.status === 'string' ? { status: event.status } : {}),
+    ...(rawInput ? { rawInput } : {}),
+    ...(boundedContent !== undefined ? { content: boundedContent } : {}),
+    ...(compactOutput !== undefined ? { rawOutput: compactOutput } : {}),
+    ...(outputTruncated ? { outputTruncated: true } : {}),
+  };
+}
+
+function mergeToolEvent(previous: RetainedToolEvent | undefined, event: RetainedToolEvent): RetainedToolEvent {
+  const hasNewOutput = event.content !== undefined || event.rawOutput !== undefined;
   return {
     ...previous, ...event,
+    name: event.name ?? previous?.name,
     title: event.title ?? previous?.title,
     kind: event.kind ?? previous?.kind,
     status: event.status ?? previous?.status,
     rawInput: previous?.rawInput && event.rawInput ? { ...previous.rawInput, ...event.rawInput } : event.rawInput ?? previous?.rawInput,
     rawOutput: event.rawOutput ?? previous?.rawOutput,
     content: event.content ?? previous?.content,
+    outputTruncated: hasNewOutput ? event.outputTruncated : previous?.outputTruncated,
   };
 }
 
@@ -177,17 +266,40 @@ export function createBackgroundTaskTracker(options: {
   holdSettleGraceMs?: number;
   /** Safety cap on a single hold; the held boundary is released when it expires. */
   maxTurnHoldMs?: number;
+  /** Maximum bytes read per transcript watcher in a single poll slice (default 64 KiB). */
+  maxTranscriptReadBytes?: number;
+  /** Maximum characters buffered for one transcript line before bounded streaming scan (default 128 KiB). */
+  maxTranscriptLineChars?: number;
+  /** Maximum characters retained for tool output and task completion summaries (default 16 KiB). */
+  maxRetainedToolOutputChars?: number;
+  /** Maximum in-flight tool records retained per thread (default 256). */
+  maxRetainedToolsPerThread?: number;
+  /** Maximum unconsumed tool events retained in the pending correlation queue (default 512). */
+  maxPendingToolEvents?: number;
+  /** Maximum characters buffered per thread for streamed text completion scanning (default 64 KiB). */
+  maxStreamBufferChars?: number;
 } = {}) {
   const threads = new Map<string, Map<string, BackgroundTask>>();
-  const pending = new Map<string, RecordedToolEvent[]>();
-  const threadTools = new Map<string, Map<string, RecordedToolEvent>>();
+  const pending = new Map<string, RetainedToolEvent[]>();
+  let pendingCount = 0;
+  const threadTools = new Map<string, Map<string, RetainedToolEvent>>();
   const streamBuffers = new Map<string, string>();
-  const watchers = new Map<string, Map<string, { offset: number; partial: string; decoder: StringDecoder }>>();
+  const watchers = new Map<string, Map<string, { offset: number; partial: string; oversizedLine: boolean; decoder: StringDecoder }>>();
   let timer: ReturnType<typeof setInterval> | undefined;
+  let catchUpTimer: ReturnType<typeof setImmediate> | undefined;
+  let readBuffer: Buffer | undefined;
   let disposed = false;
   const interval = options.pollIntervalMs ?? 500;
   const persistPath = options.persistPath || undefined;
   const maxAge = options.taskStateMaxAgeMs ?? DEFAULT_TASK_STATE_MAX_AGE_MS;
+  const maxReadBytes = Math.max(16, Math.floor(options.maxTranscriptReadBytes ?? DEFAULT_MAX_TRANSCRIPT_READ_BYTES));
+  const maxLineChars = Math.max(256, Math.floor(options.maxTranscriptLineChars ?? DEFAULT_MAX_TRANSCRIPT_LINE_CHARS));
+  const lineOverlap = Math.min(MAX_COMPLETION_OVERLAP_CHARS, Math.floor(maxLineChars / 2));
+  const maxToolOutputChars = Math.max(128, Math.floor(options.maxRetainedToolOutputChars ?? DEFAULT_MAX_RETAINED_TOOL_OUTPUT_CHARS));
+  const maxToolsPerThread = Math.max(1, Math.floor(options.maxRetainedToolsPerThread ?? DEFAULT_MAX_RETAINED_TOOLS_PER_THREAD));
+  const maxPendingEvents = Math.max(1, Math.floor(options.maxPendingToolEvents ?? DEFAULT_MAX_PENDING_TOOL_EVENTS));
+  const maxStreamChars = Math.max(256, Math.floor(options.maxStreamBufferChars ?? DEFAULT_MAX_STREAM_BUFFER_CHARS));
+  const streamOverlap = Math.min(MAX_COMPLETION_OVERLAP_CHARS, Math.floor(maxStreamChars / 2));
   const taskKey = (task: Pick<BackgroundTask, 'taskType' | 'taskId'>) => `${task.taskType === 'local_subagent' ? 'subagent' : 'task'}:${task.taskId}`;
   // Silent-turn detection state (issue: turn ends with no agent message after a failed
   // command with empty output, so BB records "No final output was recorded").
@@ -307,16 +419,21 @@ export function createBackgroundTaskTracker(options: {
       }
       if (!paths.size) watchers.delete(thread);
     }
-    if (!watchers.size && timer) { clearInterval(timer); timer = undefined; }
+    if (!watchers.size) {
+      if (timer) { clearInterval(timer); timer = undefined; }
+      if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+      readBuffer = undefined;
+    }
   }
   function settle(thread: string, id: string, status: NonNullable<BackgroundTaskDelta['status']>, taskStatus: string, summary?: string, type?: BackgroundTask['taskType']) {
     const tasks = threads.get(thread);
     const removed: BackgroundTask[] = [];
     const results: BackgroundTaskDelta[] = [];
+    const boundedSummary = summary ? boundText(summary, maxToolOutputChars) : summary;
     for (const [key, task] of tasks ?? []) {
-      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, summary)); }
+      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, boundedSummary)); }
     }
-    if (!tasks?.size) threads.delete(thread);
+    if (!tasks?.size) { threads.delete(thread); streamBuffers.delete(thread); }
     syncPolling();
     if (removed.length) {
       persistTasks(thread, removed, true);
@@ -324,45 +441,147 @@ export function createBackgroundTaskTracker(options: {
     }
     return results;
   }
-  function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
+  function inspectTextForCompletions(thread: string, text: string, maxMatchIndex = text.length): BackgroundTaskDelta[] {
+    if (!threads.get(thread)?.size) return [];
     const results: BackgroundTaskDelta[] = [];
     // Bound each result at the next announcement so failures cannot spill into another task.
     const announcements = [...text.matchAll(/Task id "([^"]+)" (finished with result:|was canceled|was killed|terminated|failed)/gi)];
     announcements.forEach((match, i) => {
+      if (match.index! >= maxMatchIndex) return;
       const result = text.slice(match.index! + match[0].length, announcements[i + 1]?.index ?? text.length);
       const failed = match[2].toLowerCase() === 'failed' || /Command exited with code ([1-9]\d*)|Encountered error/i.test(result);
       const killed = /was canceled|was killed|terminated/i.test(match[2]) || /Step was canceled/i.test(result);
       results.push(...settle(thread, match[1], failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', result.trim(), 'local_bash'));
     });
-    for (const match of text.matchAll(/Subagent ([^\s"]+) has gone idle/gi)) results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+    for (const match of text.matchAll(/Subagent ([^\s"]+) has gone idle/gi)) {
+      if (match.index! >= maxMatchIndex) break;
+      results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+    }
     return results;
   }
+  function inspectOversizedSegment(thread: string, segment: string, rawCut: number): BackgroundTaskDelta[] {
+    if (rawCut <= 0 || !COMPLETION_HINT.test(segment)) return [];
+    const prefix = unescapeOversizedText(segment.slice(0, rawCut));
+    const lookahead = rawCut < segment.length ? unescapeOversizedText(segment.slice(rawCut)) : '';
+    return inspectTextForCompletions(thread, lookahead ? `${prefix}${lookahead}` : prefix, prefix.length);
+  }
+  function safeSliceCut(text: string, overlap: number): number {
+    let cut = text.length - overlap;
+    if (cut > 0) {
+      let backslashes = 0;
+      for (let i = cut - 1; i >= 0 && text.charCodeAt(i) === 0x5c /* '\' */; i -= 1) backslashes += 1;
+      if (backslashes % 2 === 1) cut -= 1;
+    }
+    if (cut > 0 && text.charCodeAt(cut - 1) >= 0xd800 && text.charCodeAt(cut - 1) <= 0xdbff) cut -= 1;
+    return cut;
+  }
+  function consumeTranscriptChunk(
+    thread: string,
+    path: string,
+    state: { offset: number; partial: string; oversizedLine: boolean; decoder: StringDecoder },
+    chunk: string,
+  ): BackgroundTaskDelta[] {
+    const deltas: BackgroundTaskDelta[] = [];
+    const plainLines: string[] = [];
+    const flushPlain = () => {
+      if (!plainLines.length) return;
+      const block = plainLines.join('\n');
+      plainLines.length = 0;
+      if (block) deltas.push(...inspectTextForCompletions(thread, block));
+    };
+    let pos = 0;
+    while (pos < chunk.length) {
+      if (disposed || watchers.get(thread)?.get(path) !== state) break;
+      const nl = chunk.indexOf('\n', pos);
+      if (nl === -1) {
+        const rest = chunk.slice(pos);
+        const combined = state.partial ? state.partial + rest : rest;
+        if (combined.length > maxLineChars) {
+          flushPlain();
+          if (disposed || watchers.get(thread)?.get(path) !== state) break;
+          state.oversizedLine = true;
+          const cut = safeSliceCut(combined, lineOverlap);
+          deltas.push(...inspectOversizedSegment(thread, combined, cut));
+          state.partial = combined.slice(cut);
+        } else {
+          state.partial = combined;
+        }
+        break;
+      }
+      const piece = chunk.slice(pos, nl);
+      pos = nl + 1;
+      if (state.oversizedLine) {
+        flushPlain();
+        if (disposed || watchers.get(thread)?.get(path) !== state) break;
+        const tail = state.partial ? state.partial + piece : piece;
+        state.partial = '';
+        state.oversizedLine = false;
+        if (tail) deltas.push(...inspectOversizedSegment(thread, tail, tail.length));
+      } else {
+        const line = state.partial ? state.partial + piece : piece;
+        state.partial = '';
+        if (!line) continue;
+        if (line.length > maxLineChars) {
+          flushPlain();
+          if (disposed || watchers.get(thread)?.get(path) !== state) break;
+          deltas.push(...inspectOversizedSegment(thread, line, line.length));
+        } else if (plainLines.length > 0 || COMPLETION_HINT.test(line)) {
+          // Transcript records encode message text as JSON strings.
+          let parsed: unknown;
+          let isJson = false;
+          try { parsed = JSON.parse(line); isJson = true; } catch { /* plain text line */ }
+          if (isJson) {
+            flushPlain();
+            if (disposed || watchers.get(thread)?.get(path) !== state) break;
+            const extracted = extractToolOutputText({ toolCallId: '', rawOutput: parsed }).replace(/\\"/g, '"');
+            if (extracted) deltas.push(...inspectTextForCompletions(thread, extracted));
+          } else {
+            plainLines.push(line);
+          }
+        }
+      }
+    }
+    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain();
+    return deltas;
+  }
+  function scheduleCatchUp() {
+    if (catchUpTimer || disposed || !watchers.size) return;
+    catchUpTimer = setImmediate(() => {
+      catchUpTimer = undefined;
+      if (!disposed && watchers.size) poll();
+    });
+    catchUpTimer.unref?.();
+  }
   function poll() {
+    if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+    if (disposed || !watchers.size) return;
+    let hasMore = false;
     for (const [thread, paths] of watchers) for (const [path, state] of paths) {
+      if (disposed) return;
       let fd: number | undefined;
-      let text = '';
+      let chunk = '';
+      let remaining = false;
       try {
         fd = openSync(path, 'r');
         const size = fstatSync(fd).size;
-        if (size < state.offset) { state.offset = 0; state.partial = ''; state.decoder = new StringDecoder('utf8'); }
+        if (size < state.offset) { state.offset = 0; state.partial = ''; state.oversizedLine = false; state.decoder = new StringDecoder('utf8'); }
         if (size > state.offset) {
-          const buffer = Buffer.alloc(size - state.offset);
-          const count = readSync(fd, buffer, 0, buffer.length, state.offset);
+          const toRead = Math.min(size - state.offset, maxReadBytes);
+          readBuffer ??= Buffer.allocUnsafe(maxReadBytes);
+          const count = readSync(fd, readBuffer, 0, toRead, state.offset);
           state.offset += count;
-          const appended = state.partial + state.decoder.write(buffer.subarray(0, count));
-          const end = appended.lastIndexOf('\n');
-          state.partial = appended.slice(end + 1);
-          text = appended.slice(0, end + 1);
+          if (count > 0) chunk = state.decoder.write(readBuffer.subarray(0, count));
+          remaining = count > 0 && state.offset < size;
         }
       } catch { /* The CLI may not have created the transcript yet. */ }
       finally { if (fd !== undefined) closeSync(fd); }
-      if (text) {
-        // Transcript records encode message text as JSON strings.
-        text = text.split('\n').map(line => { try { return extractToolOutputText({ toolCallId: '', rawOutput: JSON.parse(line) }).replace(/\\"/g, '"'); } catch { return line; } }).join('\n');
-        const deltas = inspectTextForCompletions(thread, text);
+      if (chunk) {
+        const deltas = consumeTranscriptChunk(thread, path, state, chunk);
         if (deltas.length) options.onAsyncDeltas?.(thread, deltas);
       }
+      if (remaining && !disposed && watchers.get(thread)?.get(path) === state) hasMore = true;
     }
+    if (hasMore) scheduleCatchUp();
   }
   function handleToolEventForThread(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
     if (disposed) return [];
@@ -383,6 +602,7 @@ export function createBackgroundTaskTracker(options: {
       ?? [event.title, event.kind].find(v => /^(run_command|schedule|invoke_subagent|manage_task|manage_subagents)$/.test(v ?? '')) ?? '';
     const action = String(input.Action ?? '').toLowerCase();
     const results: BackgroundTaskDelta[] = [];
+    const outputTruncated = Boolean((event as RetainedToolEvent).outputTruncated);
     if (name === 'manage_task') {
       const id = first(input.TaskId);
       if (action === 'kill' && id) return settle(thread, id, 'interrupted', 'killed', text, 'local_bash');
@@ -391,7 +611,7 @@ export function createBackgroundTaskTracker(options: {
         const killed = /CANCELED|KILLED|interrupted/i.test(text);
         return settle(thread, id, failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', text, 'local_bash');
       }
-      if (action === 'list' && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
+      if (action === 'list' && !outputTruncated && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
         for (const task of getActiveTasks(thread)) {
           const present = containsTaskToken(text, task.taskId) || containsTaskToken(text, task.taskId.split('/').pop()!);
           if (task.taskType === 'local_bash' && !present) results.push(...settle(thread, task.taskId, 'completed', 'completed', text, task.taskType));
@@ -399,8 +619,8 @@ export function createBackgroundTaskTracker(options: {
       }
     }
     if (name === 'manage_subagents') {
-      const empty = /no active (?:direct )?subagents/i.test(text) || /^\s*\[\s*\]\s*$/.test(text)
-        || (Array.isArray(event.rawOutput) && event.rawOutput.length === 0);
+      const empty = !outputTruncated && (/no active (?:direct )?subagents/i.test(text) || /^\s*\[\s*\]\s*$/.test(text)
+        || (Array.isArray(event.rawOutput) && event.rawOutput.length === 0));
       for (const task of getActiveTasks(thread)) {
         if (task.taskType !== 'local_subagent') continue;
         const kill = action === 'kill_all' || (action === 'kill' && Array.isArray(input.ConversationIds) && input.ConversationIds.includes(task.taskId));
@@ -434,7 +654,7 @@ export function createBackgroundTaskTracker(options: {
       if (!paths.has(task.transcriptPath)) {
         let offset = 0;
         try { offset = statSync(task.transcriptPath).size; } catch { /* Start at zero when the file appears. */ }
-        paths.set(task.transcriptPath, { offset, partial: '', decoder: new StringDecoder('utf8') });
+        paths.set(task.transcriptPath, { offset, partial: '', oversizedLine: false, decoder: new StringDecoder('utf8') });
       }
       watchers.set(thread, paths);
       if (!timer) { timer = setInterval(poll, interval); timer.unref(); }
@@ -669,14 +889,54 @@ export function createBackgroundTaskTracker(options: {
     for (const record of records) initialRecords.set(recordKey(record), record);
     writeTaskState(persistPath, records);
   }
+  function retainThreadTool(thread: string, id: string, event: RecordedToolEvent) {
+    const compacted = compactToolEvent(event, maxToolOutputChars);
+    let tools = threadTools.get(thread);
+    if (!tools) { tools = new Map(); threadTools.set(thread, tools); }
+    if (tools.has(id)) tools.delete(id);
+    tools.set(id, compacted);
+    if (tools.size > maxToolsPerThread) {
+      const activeTasks = threads.get(thread);
+      for (const key of tools.keys()) {
+        if (tools.size <= maxToolsPerThread) break;
+        if (key === id) continue;
+        if (activeTasks?.get(taskKey({ taskType: 'local_bash', taskId: key }))?.orphan) continue;
+        tools.delete(key);
+      }
+      while (tools.size > maxToolsPerThread) {
+        const oldest = tools.keys().next().value;
+        if (oldest === undefined || oldest === id) break;
+        tools.delete(oldest);
+      }
+    }
+  }
   return {
     recordToolEvent(event: RecordedToolEvent) {
       if (disposed) return;
-      const queue = pending.get(event.toolCallId) ?? [];
-      queue.push(event);
-      pending.set(event.toolCallId, queue);
+      const compacted = compactToolEvent(event, maxToolOutputChars);
+      let queue = pending.get(compacted.toolCallId);
+      if (queue) {
+        pending.delete(compacted.toolCallId);
+      } else {
+        queue = [];
+      }
+      queue.push(compacted);
+      pending.set(compacted.toolCallId, queue);
+      pendingCount += 1;
+      while (pendingCount > maxPendingEvents) {
+        const oldestKey = pending.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldestQueue = pending.get(oldestKey)!;
+        oldestQueue.shift();
+        pendingCount -= 1;
+        if (!oldestQueue.length) pending.delete(oldestKey);
+      }
     },
-    handleToolEventForThread, inspectTextForCompletions, getActiveTasks, clearThread,
+    handleToolEventForThread,
+    inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
+      return inspectTextForCompletions(thread, text);
+    },
+    getActiveTasks, clearThread,
     processStdoutLine(line: string): string[] {
       let message;
       try { message = JSON.parse(line); } catch { return [line]; }
@@ -697,25 +957,60 @@ export function createBackgroundTaskTracker(options: {
         if (typeof id === 'string') {
           const queue = pending.get(id);
           const queued = queue?.shift();
-          if (!queue?.length) pending.delete(id);
+          if (queued) pendingCount = Math.max(0, pendingCount - 1);
+          if (queue && !queue.length) pending.delete(id);
           // The fallback update belongs to this exact thread; prefer it over the unscoped hook.
           const event = update && typeof update === 'object' ? { ...update, toolCallId: id } as RecordedToolEvent : queued;
-          const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
-          const known = tools.get(id);
+          const tools = threadTools.get(params.threadId);
+          const known = tools?.get(id);
           const merged = event ? mergeToolEvent(known, event) : known;
-          if (event && merged) { tools.set(id, merged); threadTools.set(params.threadId, tools); }
-          if (merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? '')) {
+          const isOrphanFlush = Boolean(
+            merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? ''),
+          );
+          const isTerminalEvent = Boolean(
+            event && merged && (TERMINAL_TOOL_STATUS.test(merged.status ?? '') || entry?.kind === 'item.close'),
+          );
+          if (isOrphanFlush && merged) {
             // SDK 0.6.178 flushes unfinished commands this way. The ACP integration test covers this shape.
             extra.push(...registerOrphanCommand(params.threadId, merged));
-          } else if (event && merged && (TERMINAL_TOOL_STATUS.test(merged.status ?? '') || entry?.kind === 'item.close')) {
+          } else if (isTerminalEvent && merged) {
             extra.push(...settleOrphanCommand(params.threadId, merged));
             extra.push(...handleToolEventForThread(params.threadId, merged));
+          }
+          const isActiveOrphan = Boolean(threads.get(params.threadId)?.get(taskKey({ taskType: 'local_bash', taskId: id }))?.orphan);
+          const shouldEvict =
+            Boolean(merged && TERMINAL_TOOL_STATUS.test(merged.status ?? '')) ||
+            (entry?.kind === 'item.close' && !isActiveOrphan && !event) ||
+            (isOrphanFlush && !isActiveOrphan);
+          if (shouldEvict) {
+            if (tools) {
+              tools.delete(id);
+              if (!tools.size) threadTools.delete(params.threadId);
+            }
+          } else if (event && merged) {
+            retainThreadTool(params.threadId, id, merged);
           }
         }
         if (entry?.settlesTurn === true) { exemptAfterHold(params.threadId, true); dropHold(params.threadId); } // e.g. provider.error: BB settles the turn itself.
         if (entry?.kind === 'turn.open' && !routeTurnOpen(params.threadId)) { modified = true; continue; }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
-          streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
+          if (threads.get(params.threadId)?.size) {
+            const existing = streamBuffers.get(params.threadId);
+            const combined = existing ? existing + entry.text : entry.text;
+            if (combined.length > maxStreamChars) {
+              const cut = safeSliceCut(combined, streamOverlap);
+              extra.push(...inspectTextForCompletions(params.threadId, combined, cut));
+              if (threads.get(params.threadId)?.size) {
+                streamBuffers.set(params.threadId, combined.slice(cut));
+              } else {
+                streamBuffers.delete(params.threadId);
+              }
+            } else {
+              streamBuffers.set(params.threadId, combined);
+            }
+          } else {
+            streamBuffers.delete(params.threadId);
+          }
           // Visible agent text (not reasoning) marks the turn as non-silent.
           if (entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
             silentState(params.threadId).agentText = true;
@@ -767,6 +1062,13 @@ export function createBackgroundTaskTracker(options: {
     handleInboundRequest(request: unknown): TrackerDelta[] { return handleInbound(request).deltas; },
     /** Whether a completed boundary is currently held for the thread. */
     isHoldingTurn(thread: string): boolean { return holds.get(thread)?.boundary !== undefined; },
-    dispose() { disposed = true; for (const hold of holds.values()) clearHoldTimers(hold); holds.clear(); threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
+    dispose() {
+      disposed = true;
+      for (const hold of holds.values()) clearHoldTimers(hold);
+      holds.clear(); threads.clear(); pending.clear(); pendingCount = 0; threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear();
+      if (timer) { clearInterval(timer); timer = undefined; }
+      if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+      readBuffer = undefined;
+    },
   };
 }
