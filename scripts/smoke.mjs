@@ -11,7 +11,9 @@ import manifest from '../package.json' with { type: 'json' };
 const command = resolveAntigravityCommand('agy');
 if (!command) throw new Error('Antigravity CLI was not found on this host.');
 const cwd = await mkdtemp(join(tmpdir(), 'bb-antigravity-smoke-'));
-const child = spawn(command, ['acp', '--disable-telemetry'], { cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+const child = spawn(command, ['acp', '--disable-telemetry'], {
+  cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true,
+});
 const closed = new Promise(resolve => child.once('close', resolve));
 const pending = new Map();
 let id = 0;
