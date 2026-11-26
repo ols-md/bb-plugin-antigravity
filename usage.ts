@@ -330,24 +330,68 @@ const providerUsageSourceContract = defineRpcContract({
   },
 });
 
+const DEFAULT_PROVIDER_LABEL = "Antigravity CLI";
 const resourceIdTupleSchema = z.tuple([z.string().min(1), z.string().min(1)]);
+
+function isNotFoundError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "status" in error && (error as { status?: unknown }).status === 404;
+}
+
+function resourceHostId(resourceId: string): string | null {
+  try {
+    const parsed = resourceIdTupleSchema.safeParse(JSON.parse(resourceId));
+    return parsed.success ? parsed.data[0] : null;
+  } catch {
+    return null;
+  }
+}
 
 export function registerAntigravityUsageSource(bb: BbPluginApi) {
   if (!bb.rpc || !bb.sdk) return;
 
+  type UsageResource = z.infer<typeof usageResourceSchema>;
   type CachedObservation = z.infer<typeof getResourceOutputSchema>;
+  const expectedPluginId = bb.pluginId ?? PLUGIN_ID;
   const cache = new Map<string, CachedObservation>();
+  const knownResources = new Map<string, UsageResource>();
   const inflight = new Map<string, { refresh: boolean; promise: Promise<CachedObservation> }>();
+
+  const isOwnedUsageProvider = (provider: { id: string; pluginId?: string | null }) =>
+    provider.id === PROVIDER_ID && provider.pluginId === expectedPluginId;
+
+  const evictResource = (resourceId: string) => {
+    cache.delete(resourceId);
+    knownResources.delete(resourceId);
+  };
+
+  const evictHost = (hostId: string) => {
+    for (const id of new Set([...cache.keys(), ...knownResources.keys()])) {
+      if (resourceHostId(id) === hostId) evictResource(id);
+    }
+  };
+
+  const toUsageResource = (host: { id: string; name: string }, label?: string): UsageResource => {
+    const id = JSON.stringify([host.id, PROVIDER_ID]);
+    const remembered = knownResources.get(id);
+    return {
+      id,
+      accountKey: cache.get(id)?.accountKey ?? remembered?.accountKey ?? null,
+      providerId: PROVIDER_ID,
+      label: label || remembered?.label || DEFAULT_PROVIDER_LABEL,
+      scope: {
+        kind: "host",
+        hostId: host.id,
+        hostName: host.name,
+      },
+    };
+  };
 
   const loadResource = async (resourceId: string, refresh: boolean): Promise<CachedObservation> => {
     const [hostId, providerId] = resourceIdTupleSchema.parse(JSON.parse(resourceId));
-    const host = await bb.sdk.hosts.get({ hostId }).catch((error: unknown) => {
-      if (error instanceof Error && "status" in error && error.status === 404) {
-        cache.delete(resourceId);
-        throw new Error("Usage resource no longer exists.");
-      }
-      throw error;
-    });
+    if (providerId !== PROVIDER_ID) {
+      evictResource(resourceId);
+      throw new Error("Usage resource no longer exists.");
+    }
     const previous = cache.get(resourceId);
     const unavailable = (message: string): CachedObservation =>
       getResourceOutputSchema.parse({
@@ -361,15 +405,34 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         },
       });
 
+    let host: Awaited<ReturnType<typeof bb.sdk.hosts.get>>;
+    try {
+      host = await bb.sdk.hosts.get({ hostId });
+    } catch (error: unknown) {
+      if (isNotFoundError(error)) {
+        evictHost(hostId);
+        throw new Error("Usage resource no longer exists.");
+      }
+      return unavailable("Usage could not be collected from this machine.");
+    }
+
     if (host.status === "disconnected") {
       return unavailable("Machine is disconnected.");
     }
 
-    const providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
-    if (!providers.some(p => p.id === providerId && p.pluginId === (bb.pluginId ?? PLUGIN_ID) && p.id === PROVIDER_ID)) {
-      cache.delete(resourceId);
+    let providers: Awaited<ReturnType<typeof bb.sdk.providers.list>>;
+    try {
+      providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
+    } catch {
+      return unavailable("Usage inventory could not be loaded from this machine.");
+    }
+
+    const matchedProvider = providers.find(isOwnedUsageProvider);
+    if (!matchedProvider) {
+      evictResource(resourceId);
       throw new Error("Usage resource no longer exists.");
     }
+    knownResources.set(resourceId, toUsageResource(host, matchedProvider.displayName));
 
     if (
       !refresh &&
@@ -388,7 +451,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       }
       const rawRecord = rawUsage as Record<string, unknown>;
       const result = getResourceOutputSchema.parse({
-        accountKey: null,
+        accountKey: previous?.accountKey ?? null,
         observedAt: rawUsage.status === "ok" ? Date.now() : previous?.observedAt ?? null,
         usage: {
           ...rawUsage,
@@ -406,7 +469,9 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
             : {}),
         },
       });
-      cache.set(resourceId, result);
+      if (rawUsage.status !== "error" || previous?.usage.status !== "ok") {
+        cache.set(resourceId, result);
+      }
       return result;
     } catch {
       return unavailable("Usage could not be collected from this machine.");
@@ -432,34 +497,40 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     {
       async [LIST_RESOURCES_METHOD]() {
         const hosts = await bb.sdk.hosts.list();
-        const resources = (
-          await Promise.all(
-            hosts.map(async host => {
-              const providers = await bb.sdk.providers.list({ hostId: host.id, capability: "usage" });
-              return providers
-                .filter(p => p.pluginId === (bb.pluginId ?? PLUGIN_ID) && p.id === PROVIDER_ID)
-                .map(p => {
-                  const id = JSON.stringify([host.id, p.id]);
-                  return {
-                    id,
-                    accountKey: cache.get(id)?.accountKey ?? null,
-                    providerId: p.id,
-                    label: p.displayName,
-                    scope: {
-                      kind: "host" as const,
-                      hostId: host.id,
-                      hostName: host.name,
-                    },
-                  };
-                });
-            }),
-          )
-        ).flat();
+        const settled = await Promise.allSettled(
+          hosts.map(host => bb.sdk.providers.list({ hostId: host.id, capability: "usage" })),
+        );
 
-        const validIds = new Set(resources.map(r => r.id));
-        for (const cachedId of cache.keys()) {
-          if (!validIds.has(cachedId)) cache.delete(cachedId);
+        const resources: UsageResource[] = [];
+        const liveHostIds = new Set(hosts.map(host => host.id));
+        const confirmedHostIds = new Set<string>();
+        const confirmedResourceIds = new Set<string>();
+
+        for (const [index, host] of hosts.entries()) {
+          const outcome = settled[index];
+          if (outcome.status === "fulfilled") {
+            confirmedHostIds.add(host.id);
+            for (const provider of outcome.value.filter(isOwnedUsageProvider)) {
+              const resource = toUsageResource(host, provider.displayName);
+              knownResources.set(resource.id, resource);
+              confirmedResourceIds.add(resource.id);
+              resources.push(resource);
+            }
+          } else {
+            // Preserve failed-host visibility without evicting cached state; confirmed removal happens only on fulfilled empty inventory or missing host.
+            resources.push(toUsageResource(host));
+          }
         }
+
+        for (const cachedId of new Set([...cache.keys(), ...knownResources.keys()])) {
+          const hostId = resourceHostId(cachedId);
+          if (!hostId || !liveHostIds.has(hostId)) {
+            evictResource(cachedId);
+          } else if (confirmedHostIds.has(hostId) && !confirmedResourceIds.has(cachedId)) {
+            evictResource(cachedId);
+          }
+        }
+
         return { resources };
       },
       [GET_RESOURCE_METHOD]: ({ resourceId, refresh }) => collectResource(resourceId, refresh),

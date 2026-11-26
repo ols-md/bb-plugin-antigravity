@@ -313,3 +313,175 @@ test('evicts cached usage when the provider is removed', async () => {
   await getResource({ resourceId, refresh: false });
   assert.equal(collections, 2);
 });
+
+test('keeps healthy hosts visible, reports failed inventory, and recovers on retry', async () => {
+  let handlers;
+  let host2Failing = true;
+  const collections = new Map();
+  const hosts = [
+    { id: 'host_1', name: 'Primary Machine', status: 'connected' },
+    { id: 'host_2', name: 'Remote Machine', status: 'connected' },
+  ];
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => hosts,
+        get: async ({ hostId }) => hosts.find(h => h.id === hostId),
+      },
+      providers: {
+        list: async ({ hostId }) => {
+          if (hostId === 'host_2' && host2Failing) {
+            throw new Error('Remote host lookup timed out');
+          }
+          return [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI (Remote)' }];
+        },
+      },
+      system: {
+        usageLimits: async ({ hostId }) => {
+          collections.set(hostId, (collections.get(hostId) ?? 0) + 1);
+          return { 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage };
+        },
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+
+  const firstList = await listResources({});
+  assert.equal(firstList.resources.length, 2);
+  assert.equal(firstList.resources[0].scope.hostId, 'host_1');
+  assert.equal(firstList.resources[1].scope.hostId, 'host_2');
+
+  const healthyUsage = await getResource({ resourceId: firstList.resources[0].id, refresh: true });
+  assert.equal(healthyUsage.usage.status, 'ok');
+  assert.equal(healthyUsage.usage.windows.length, 5);
+
+  const failedUsage = await getResource({ resourceId: firstList.resources[1].id, refresh: true });
+  assert.equal(failedUsage.usage.status, 'error');
+  assert.equal(failedUsage.observedAt, null);
+
+  host2Failing = false;
+  const recoveredList = await listResources({});
+  assert.equal(recoveredList.resources.length, 2);
+  assert.equal(recoveredList.resources[1].label, 'Antigravity CLI (Remote)');
+
+  const recoveredUsage = await getResource({ resourceId: recoveredList.resources[1].id, refresh: true });
+  assert.equal(recoveredUsage.usage.status, 'ok');
+  assert.equal(recoveredUsage.usage.windows.length, 5);
+  assert.equal(collections.get('host_1'), 1);
+  assert.equal(collections.get('host_2'), 1);
+});
+
+test('preserves cached observations across transient host lookup failures and evicts only on confirmed removal', async () => {
+  let handlers;
+  let host2LookupFails = false;
+  let host2GetError = null;
+  let host2Enabled = true;
+  let host2Present = true;
+  const collections = new Map();
+  const makeHosts = () => [
+    { id: 'host_1', name: 'Primary Machine', status: 'connected' },
+    ...(host2Present ? [{ id: 'host_2', name: 'Remote Machine', status: 'connected' }] : []),
+  ];
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => makeHosts(),
+        get: async ({ hostId }) => {
+          if (hostId === 'host_2' && host2GetError) {
+            throw host2GetError;
+          }
+          const found = makeHosts().find(h => h.id === hostId);
+          if (!found) {
+            throw Object.assign(new Error('Host not found'), { status: 404 });
+          }
+          return found;
+        },
+      },
+      providers: {
+        list: async ({ hostId }) => {
+          if (hostId === 'host_2' && host2LookupFails) {
+            throw new Error('Transient RPC failure');
+          }
+          if (hostId === 'host_2' && !host2Enabled) {
+            return [];
+          }
+          return [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }];
+        },
+      },
+      system: {
+        usageLimits: async ({ hostId }) => {
+          collections.set(hostId, (collections.get(hostId) ?? 0) + 1);
+          return { 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage };
+        },
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
+  const host2Id = JSON.stringify(['host_2', 'antigravity-cli']);
+
+  await listResources({});
+  const initialHost1 = await getResource({ resourceId: host1Id, refresh: true });
+  const initialHost2 = await getResource({ resourceId: host2Id, refresh: true });
+  assert.equal(initialHost1.usage.status, 'ok');
+  assert.equal(initialHost2.usage.status, 'ok');
+  assert.ok(initialHost2.observedAt !== null);
+
+  // Transient inventory failure on host_2 keeps host_1 healthy and preserves host_2 cache.
+  host2LookupFails = true;
+  const listDuringFailure = await listResources({});
+  assert.deepEqual(listDuringFailure.resources.map(r => r.id), [host1Id, host2Id]);
+  const host1DuringFailure = await getResource({ resourceId: host1Id, refresh: false });
+  assert.equal(host1DuringFailure.usage.status, 'ok');
+  assert.equal(collections.get('host_1'), 1);
+
+  const host2DuringFailure = await getResource({ resourceId: host2Id, refresh: true });
+  assert.equal(host2DuringFailure.usage.status, 'error');
+  assert.equal(host2DuringFailure.observedAt, initialHost2.observedAt);
+
+  // Transient non-404 hosts.get error also preserves cached observation.
+  host2LookupFails = false;
+  host2GetError = Object.assign(new Error('Gateway unavailable'), { status: 503 });
+  const host2TransientGetError = await getResource({ resourceId: host2Id, refresh: true });
+  assert.equal(host2TransientGetError.usage.status, 'error');
+  assert.equal(host2TransientGetError.observedAt, initialHost2.observedAt);
+
+  // Recovery serves preserved cached observation when refresh is false.
+  host2GetError = null;
+  const host2RecoveredCached = await getResource({ resourceId: host2Id, refresh: false });
+  assert.equal(host2RecoveredCached.usage.status, 'ok');
+  assert.equal(host2RecoveredCached.observedAt, initialHost2.observedAt);
+  assert.equal(collections.get('host_2'), 1);
+
+  // Confirmed provider removal on host_2 evicts cache and drops host_2 from inventory.
+  host2Enabled = false;
+  const listAfterProviderRemoved = await listResources({});
+  assert.deepEqual(listAfterProviderRemoved.resources.map(r => r.id), [host1Id]);
+  await assert.rejects(getResource({ resourceId: host2Id, refresh: false }), /no longer exists/);
+
+  // Re-enabling requires a fresh collection because confirmed removal evicted cache.
+  host2Enabled = true;
+  await listResources({});
+  await getResource({ resourceId: host2Id, refresh: false });
+  assert.equal(collections.get('host_2'), 2);
+
+  // Confirmed host removal from hosts.list() also evicts cache.
+  host2Present = false;
+  const listAfterHostRemoved = await listResources({});
+  assert.deepEqual(listAfterHostRemoved.resources.map(r => r.id), [host1Id]);
+  await assert.rejects(getResource({ resourceId: host2Id, refresh: false }), /no longer exists/);
+  host2Present = true;
+  await listResources({});
+  await getResource({ resourceId: host2Id, refresh: false });
+  assert.equal(collections.get('host_2'), 3);
+});
