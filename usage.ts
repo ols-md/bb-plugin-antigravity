@@ -351,37 +351,63 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
   type UsageResource = z.infer<typeof usageResourceSchema>;
   type CachedObservation = z.infer<typeof getResourceOutputSchema>;
+  type InflightEntry = {
+    resourceId: string;
+    hostId: string;
+    seq: number;
+    refresh: boolean;
+    invalidated: boolean;
+    promise: Promise<CachedObservation>;
+  };
+  type ActiveListSnapshot = {
+    seq: number;
+    invalidatedResources: Set<string>;
+    protectedResources: Set<string>;
+    newerHostSnapshots: Array<Set<string>>;
+  };
+
   const expectedPluginId = bb.pluginId ?? PLUGIN_ID;
   const cache = new Map<string, CachedObservation>();
   const knownResources = new Map<string, UsageResource>();
-  const inflight = new Map<string, { refresh: boolean; promise: Promise<CachedObservation> }>();
-  let mutationSeq = 0;
-  const confirmedAt = new Map<string, number>();
-  const evictedAt = new Map<string, number>();
-  let latestHostSnapshot: { seq: number; hostIds: Set<string> } | null = null;
+  const inflight = new Map<string, InflightEntry>();
+  const activeLists = new Set<ActiveListSnapshot>();
+  let requestSeq = 0;
 
   const isOwnedUsageProvider = (provider: { id: string; pluginId?: string | null }) =>
     provider.id === PROVIDER_ID && provider.pluginId === expectedPluginId;
 
   const toResourceId = (hostId: string) => JSON.stringify([hostId, PROVIDER_ID]);
 
-  const confirmResource = (resource: UsageResource, seq = ++mutationSeq): boolean => {
-    if (seq < (evictedAt.get(resource.id) ?? 0)) return false;
+  const invalidateInflight = (resourceId: string) => {
+    const entry = inflight.get(resourceId);
+    if (!entry) return;
+    entry.invalidated = true;
+    inflight.delete(resourceId);
+  };
+
+  const confirmResource = (resource: UsageResource, sourceSeq: number, listToken?: ActiveListSnapshot): boolean => {
+    if (listToken?.invalidatedResources.has(resource.id)) return false;
     knownResources.set(resource.id, resource);
-    confirmedAt.set(resource.id, Math.max(confirmedAt.get(resource.id) ?? 0, seq));
+    for (const activeList of activeLists) {
+      if (activeList !== listToken && activeList.seq < sourceSeq) {
+        activeList.protectedResources.add(resource.id);
+      }
+    }
     return true;
   };
 
-  const evictResource = (resourceId: string, seq = ++mutationSeq) => {
-    if (seq < (confirmedAt.get(resourceId) ?? 0)) return;
+  const evictResource = (resourceId: string) => {
     cache.delete(resourceId);
     knownResources.delete(resourceId);
-    evictedAt.set(resourceId, Math.max(evictedAt.get(resourceId) ?? 0, seq));
+    invalidateInflight(resourceId);
+    for (const activeList of activeLists) {
+      activeList.invalidatedResources.add(resourceId);
+    }
   };
 
-  const evictHost = (hostId: string, seq = ++mutationSeq) => {
+  const evictHost = (hostId: string) => {
     for (const id of new Set([...cache.keys(), ...knownResources.keys(), toResourceId(hostId)])) {
-      if (resourceHostId(id) === hostId) evictResource(id, seq);
+      if (resourceHostId(id) === hostId) evictResource(id);
     }
   };
 
@@ -401,7 +427,11 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     };
   };
 
-  const loadResource = async (resourceId: string, refresh: boolean): Promise<CachedObservation> => {
+  const loadResource = async (
+    resourceId: string,
+    refresh: boolean,
+    entry: InflightEntry,
+  ): Promise<CachedObservation> => {
     const [hostId, providerId] = resourceIdTupleSchema.parse(JSON.parse(resourceId));
     if (providerId !== PROVIDER_ID) {
       evictResource(resourceId);
@@ -420,27 +450,26 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         },
       });
 
-    const isEvictedSince = (hostSeq: number, providerSeq: number) =>
-      (evictedAt.get(resourceId) ?? 0) > providerSeq ||
-      (latestHostSnapshot !== null && latestHostSnapshot.seq > hostSeq && !latestHostSnapshot.hostIds.has(hostId));
-
-    const hostCheckSeq = ++mutationSeq;
     let host: Awaited<ReturnType<typeof bb.sdk.hosts.get>>;
     try {
       host = await bb.sdk.hosts.get({ hostId });
     } catch (error: unknown) {
       if (isNotFoundError(error)) {
-        evictHost(hostId, hostCheckSeq);
+        if (!entry.invalidated) evictHost(hostId);
         throw new Error("Usage resource no longer exists.");
       }
       return unavailable("Usage could not be collected from this machine.");
+    }
+
+    if (entry.invalidated) {
+      throw new Error("Usage resource no longer exists.");
     }
 
     if (host.status === "disconnected") {
       return unavailable("Machine is disconnected.");
     }
 
-    const providerCheckSeq = ++mutationSeq;
+    const providerCheckSeq = ++requestSeq;
     let providers: Awaited<ReturnType<typeof bb.sdk.providers.list>>;
     try {
       providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
@@ -448,17 +477,16 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       return unavailable("Usage inventory could not be loaded from this machine.");
     }
 
+    if (entry.invalidated) {
+      throw new Error("Usage resource no longer exists.");
+    }
+
     const matchedProvider = providers.find(isOwnedUsageProvider);
     if (!matchedProvider) {
-      evictResource(resourceId, providerCheckSeq);
+      evictResource(resourceId);
       throw new Error("Usage resource no longer exists.");
     }
-    if (
-      isEvictedSince(hostCheckSeq, providerCheckSeq) ||
-      !confirmResource(toUsageResource(host, matchedProvider.displayName), providerCheckSeq)
-    ) {
-      throw new Error("Usage resource no longer exists.");
-    }
+    confirmResource(toUsageResource(host, matchedProvider.displayName), providerCheckSeq);
 
     if (
       !refresh &&
@@ -499,13 +527,13 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         },
       });
     } catch {
-      if (isEvictedSince(hostCheckSeq, providerCheckSeq)) {
+      if (entry.invalidated) {
         throw new Error("Usage resource no longer exists.");
       }
       return unavailable("Usage could not be collected from this machine.");
     }
 
-    if (isEvictedSince(hostCheckSeq, providerCheckSeq)) {
+    if (entry.invalidated) {
       throw new Error("Usage resource no longer exists.");
     }
     if (rawStatus !== "error" || previous?.usage.status !== "ok") {
@@ -516,81 +544,115 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
   const collectResource = async (resourceId: string, refresh: boolean): Promise<CachedObservation> => {
     const existing = inflight.get(resourceId);
-    if (existing) {
+    if (existing && !existing.invalidated) {
       if (!refresh || existing.refresh) return existing.promise;
       await existing.promise.catch(() => {});
       return collectResource(resourceId, refresh);
     }
-    const promise = loadResource(resourceId, refresh).finally(() => {
-      inflight.delete(resourceId);
+    const hostId = resourceHostId(resourceId) ?? "";
+    const entry: InflightEntry = {
+      resourceId,
+      hostId,
+      seq: ++requestSeq,
+      refresh,
+      invalidated: false,
+      promise: undefined as unknown as Promise<CachedObservation>,
+    };
+    entry.promise = loadResource(resourceId, refresh, entry).finally(() => {
+      if (inflight.get(resourceId) === entry) {
+        inflight.delete(resourceId);
+      }
     });
-    inflight.set(resourceId, { refresh, promise });
-    return promise;
+    inflight.set(resourceId, entry);
+    return entry.promise;
   };
 
   bb.rpc.register(
     providerUsageSourceContract,
     {
       async [LIST_RESOURCES_METHOD]() {
-        const snapshotSeq = ++mutationSeq;
-        const hosts = await bb.sdk.hosts.list();
-        const connectedHosts = hosts.filter(host => host.status !== "disconnected");
-        const settled = await Promise.allSettled(
-          connectedHosts.map(host => bb.sdk.providers.list({ hostId: host.id, capability: "usage" })),
-        );
-        const outcomesByHostId = new Map(
-          connectedHosts.map((host, index) => [host.id, settled[index]] as const),
-        );
+        const snapshotSeq = ++requestSeq;
+        const listToken: ActiveListSnapshot = {
+          seq: snapshotSeq,
+          invalidatedResources: new Set(),
+          protectedResources: new Set(),
+          newerHostSnapshots: [],
+        };
+        activeLists.add(listToken);
+        try {
+          const hosts = await bb.sdk.hosts.list();
+          const liveHostIds = new Set(hosts.map(host => host.id));
 
-        const resources: UsageResource[] = [];
-        const liveHostIds = new Set(hosts.map(host => host.id));
-        const confirmedHostIds = new Set<string>();
-        const confirmedResourceIds = new Set<string>();
+          for (const activeList of activeLists) {
+            if (activeList.seq < snapshotSeq) {
+              activeList.newerHostSnapshots.push(liveHostIds);
+            }
+          }
+          for (const entry of inflight.values()) {
+            if (entry.seq < snapshotSeq && !liveHostIds.has(entry.hostId)) {
+              invalidateInflight(entry.resourceId);
+            }
+          }
 
-        for (const host of hosts) {
-          if (host.status === "disconnected") {
-            if (knownResources.has(toResourceId(host.id))) {
+          const connectedHosts = hosts.filter(host => host.status !== "disconnected");
+          const settled = await Promise.allSettled(
+            connectedHosts.map(host => bb.sdk.providers.list({ hostId: host.id, capability: "usage" })),
+          );
+          const outcomesByHostId = new Map(
+            connectedHosts.map((host, index) => [host.id, settled[index]] as const),
+          );
+
+          const resources: UsageResource[] = [];
+          const confirmedHostIds = new Set<string>();
+          const confirmedResourceIds = new Set<string>();
+
+          for (const host of hosts) {
+            const expectedId = toResourceId(host.id);
+            const absentInNewerSnapshot = listToken.newerHostSnapshots.some(ids => !ids.has(host.id));
+            if (host.status === "disconnected") {
+              if (!absentInNewerSnapshot && knownResources.has(expectedId)) {
+                resources.push(toUsageResource(host));
+              }
+              continue;
+            }
+            const outcome = outcomesByHostId.get(host.id)!;
+            if (outcome.status === "fulfilled") {
+              confirmedHostIds.add(host.id);
+              if (absentInNewerSnapshot) continue;
+              for (const provider of outcome.value.filter(isOwnedUsageProvider)) {
+                const resource = toUsageResource(host, provider.displayName);
+                if (confirmResource(resource, snapshotSeq, listToken)) {
+                  confirmedResourceIds.add(resource.id);
+                  resources.push(resource);
+                }
+              }
+            } else if (!absentInNewerSnapshot && knownResources.has(expectedId)) {
+              // Preserve previously confirmed host visibility without inventing resources for unconfirmed hosts.
               resources.push(toUsageResource(host));
             }
-            continue;
           }
-          const outcome = outcomesByHostId.get(host.id)!;
-          if (outcome.status === "fulfilled") {
-            confirmedHostIds.add(host.id);
-            for (const provider of outcome.value.filter(isOwnedUsageProvider)) {
-              const resource = toUsageResource(host, provider.displayName);
-              if (confirmResource(resource, snapshotSeq)) {
-                confirmedResourceIds.add(resource.id);
-                resources.push(resource);
-              }
+
+          for (const hostId of confirmedHostIds) {
+            const expectedId = toResourceId(hostId);
+            if (!confirmedResourceIds.has(expectedId) && !listToken.protectedResources.has(expectedId)) {
+              evictResource(expectedId);
             }
-          } else if (knownResources.has(toResourceId(host.id))) {
-            // Preserve previously confirmed host visibility without inventing resources for unconfirmed hosts.
-            resources.push(toUsageResource(host));
           }
-        }
 
-        if (!latestHostSnapshot || snapshotSeq > latestHostSnapshot.seq) {
-          latestHostSnapshot = { seq: snapshotSeq, hostIds: liveHostIds };
-        }
-
-        for (const hostId of confirmedHostIds) {
-          const expectedId = toResourceId(hostId);
-          if (!confirmedResourceIds.has(expectedId)) {
-            evictResource(expectedId, snapshotSeq);
+          for (const cachedId of new Set([...cache.keys(), ...knownResources.keys()])) {
+            if (listToken.protectedResources.has(cachedId)) continue;
+            const hostId = resourceHostId(cachedId);
+            if (!hostId || !liveHostIds.has(hostId)) {
+              evictResource(cachedId);
+            } else if (confirmedHostIds.has(hostId) && !confirmedResourceIds.has(cachedId)) {
+              evictResource(cachedId);
+            }
           }
-        }
 
-        for (const cachedId of new Set([...cache.keys(), ...knownResources.keys()])) {
-          const hostId = resourceHostId(cachedId);
-          if (!hostId || !liveHostIds.has(hostId)) {
-            evictResource(cachedId, snapshotSeq);
-          } else if (confirmedHostIds.has(hostId) && !confirmedResourceIds.has(cachedId)) {
-            evictResource(cachedId, snapshotSeq);
-          }
+          return { resources };
+        } finally {
+          activeLists.delete(listToken);
         }
-
-        return { resources };
       },
       [GET_RESOURCE_METHOD]: ({ resourceId, refresh }) => collectResource(resourceId, refresh),
     },

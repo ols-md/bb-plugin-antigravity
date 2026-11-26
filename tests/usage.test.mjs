@@ -674,3 +674,125 @@ test('disconnected host retains only its known resources without querying provid
   assert.equal(host1Reconnected.usage.status, 'ok');
   assert.equal(host1Reconnected.observedAt, host1Initial.observedAt);
 });
+
+test('older first discovery cannot revive an absent host', async () => {
+  let handlers;
+  let releaseOldProvider;
+  const oldProviderStarted = new Promise(resolve => {
+    releaseOldProvider = resolve;
+  });
+  let finishOldProvider;
+  const oldProviderGate = new Promise(resolve => {
+    finishOldProvider = resolve;
+  });
+  let host2Present = true;
+  let listCalls = 0;
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [
+          { id: 'host_1', name: 'Primary Machine', status: 'connected' },
+          ...(host2Present ? [{ id: 'host_2', name: 'Remote Machine', status: 'connected' }] : []),
+        ],
+        get: async ({ hostId }) => {
+          if (hostId === 'host_2' && !host2Present) {
+            throw Object.assign(new Error('Host not found'), { status: 404 });
+          }
+          return { id: hostId, name: hostId, status: 'connected' };
+        },
+      },
+      providers: {
+        list: async ({ hostId }) => {
+          if (hostId === 'host_2') {
+            listCalls++;
+            if (listCalls === 1) {
+              releaseOldProvider();
+              await oldProviderGate;
+            }
+          }
+          return [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }];
+        },
+      },
+      system: {
+        usageLimits: async () => ({ 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage }),
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host2Id = JSON.stringify(['host_2', 'antigravity-cli']);
+
+  const olderDiscovery = listResources({});
+  await oldProviderStarted;
+
+  host2Present = false;
+  const newerList = await listResources({});
+  assert.deepEqual(newerList.resources.map(r => r.scope.hostId), ['host_1']);
+
+  finishOldProvider();
+  const olderResult = await olderDiscovery;
+  assert.deepEqual(olderResult.resources.map(r => r.scope.hostId), ['host_1']);
+
+  await assert.rejects(getResource({ resourceId: host2Id, refresh: false }), /no longer exists/);
+});
+
+test('getResource after deletion and re-add does not join invalidated in-flight work', async () => {
+  let handlers;
+  let enabled = true;
+  let usageCall = 0;
+  let releaseSlowGet;
+  const slowGetStarted = new Promise(resolve => {
+    releaseSlowGet = resolve;
+  });
+  let finishSlowGet;
+  const slowGetGate = new Promise(resolve => {
+    finishSlowGet = resolve;
+  });
+
+  registerAntigravityUsageSource({
+    pluginId: 'antigravity-cli',
+    rpc: { register(_contract, registered) { handlers = registered; } },
+    sdk: {
+      hosts: {
+        list: async () => [{ id: 'host_1', name: 'Primary Machine', status: 'connected' }],
+        get: async ({ hostId }) => ({ id: hostId, name: 'Primary Machine', status: 'connected' }),
+      },
+      providers: {
+        list: async () => enabled ? [{ id: 'antigravity-cli', pluginId: 'antigravity-cli', displayName: 'Antigravity CLI' }] : [],
+      },
+      system: {
+        usageLimits: async () => {
+          usageCall++;
+          if (usageCall === 1) {
+            releaseSlowGet();
+            await slowGetGate;
+          }
+          return { 'antigravity-cli': normalizeAntigravityUsageOutput(SAMPLE_USAGE_JSON).usage };
+        },
+      },
+    },
+  });
+
+  const listResources = handlers['provider-usage.v1.listResources'];
+  const getResource = handlers['provider-usage.v1.getResource'];
+  const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
+
+  const firstGet = getResource({ resourceId: host1Id, refresh: true });
+  await slowGetStarted;
+
+  enabled = false;
+  await listResources({});
+  enabled = true;
+  await listResources({});
+
+  const secondGet = await getResource({ resourceId: host1Id, refresh: true });
+  assert.equal(secondGet.usage.status, 'ok');
+  assert.equal(usageCall, 2);
+
+  finishSlowGet();
+  await assert.rejects(firstGet, /no longer exists/);
+});
