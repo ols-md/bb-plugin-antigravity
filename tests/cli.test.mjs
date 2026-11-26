@@ -3,11 +3,30 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { providerHealthResultSchema } from '@get-bb/plugin-sdk/provider-bridge';
+import { providerHealthResultSchema, providerInstallationStatusSchema } from '@get-bb/plugin-sdk/provider-bridge';
 import { resolveAntigravityCommand, resolveAntigravityLaunchSpec } from '../cli.ts';
 import { readAntigravityProviderUsage } from '../usage.ts';
+
+function callBridge(requests, options) {
+  const fixture = fileURLToPath(new URL('./health-bridge-fixture.mjs', import.meta.url));
+  const run = spawnSync(process.execPath, ['--experimental-strip-types', fixture], {
+    ...options,
+    input: requests.map((request, id) => JSON.stringify({ jsonrpc: '2.0', id, ...request })).join('\n') + '\n',
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  assert.ifError(run.error);
+  assert.equal(run.status, 0, run.stderr);
+  const responses = run.stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(responses.length, requests.length);
+  return new Map(responses.map(response => [response.id, response]));
+}
+
+function writeDecoy(path) {
+  mkdirSync(parse(path).dir, { recursive: true });
+  writeFileSync(path, 'inert test fixture', { mode: 0o755 });
+}
 
 test('Windows installer location works without agy on PATH for launch and usage', { skip: process.platform !== 'win32' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'agy-resolution-'));
@@ -86,6 +105,75 @@ test('explicit executable paths are preserved', () => {
   assert.equal(request.params.providerOptions.acpLaunchSpec.command, process.execPath);
 });
 
+test('the bridge reports a missing CLI with a relative host home and PATH', t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'agy-relative-home-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const windows = process.platform === 'win32';
+  const executable = windows ? 'agy.exe' : 'agy';
+  const home = 'relative-home';
+  writeDecoy(join(cwd, executable));
+  writeDecoy(join(cwd, 'bin', executable));
+  writeDecoy(windows
+    ? join(cwd, home, 'AppData', 'Local', 'agy', 'bin', executable)
+    : join(cwd, home, '.local', 'bin', executable));
+
+  const providerOptions = { acpLaunchSpec: { command: 'agy', args: ['acp'], env: {}, displayName: 'Antigravity CLI' } };
+  const maintenance = { providerId: 'antigravity-cli', providerOptions, envVars: { PATH: cwd } };
+  const responses = callBridge([
+    { method: 'initialize', params: { protocolVersion: 1, client: { name: 'test', version: '1' } } },
+    { method: 'thread/start', params: {
+      threadId: 'thread', cwd, instructionMode: 'append',
+      options: {
+        permissionMode: 'accept-edits', permissionScope: 'workspace', approvalReviewer: 'user',
+        permissionEscalation: 'ask', providerOptions, envVars: { PATH: cwd },
+      },
+    } },
+    { method: 'provider/health', params: maintenance },
+    { method: 'provider/usage', params: maintenance },
+    { method: 'provider/usage', params: { providerId: 'antigravity-cli' } },
+    { method: 'provider/health', params: { providerId: 'antigravity-cli' } },
+    { method: 'provider/installation/status', params: maintenance },
+    { method: 'provider/installation/run', params: { ...maintenance, action: 'install' } },
+  ], {
+    cwd,
+    env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: '', PATH: 'bin' },
+  });
+  assert.equal(responses.get(0).result.ok, true);
+  assert.deepEqual(responses.get(1).error, {
+    code: -32000, message: 'Antigravity CLI (agy) was not found on the agent host.',
+  });
+  assert.equal(providerHealthResultSchema.parse(responses.get(2).result).health.status, 'not_installed');
+  assert.deepEqual(responses.get(3).result, { supported: true, usage: { status: 'not_installed' } });
+  assert.deepEqual(responses.get(4).result, responses.get(3).result);
+  assert.equal(providerHealthResultSchema.parse(responses.get(5).result).health.status, 'unknown');
+  assert.equal(providerInstallationStatusSchema.parse(responses.get(6).result).installed, false);
+  assert.equal(responses.get(7).result.available, false);
+});
+
+test('the bridge skips Windows PATH and LOCALAPPDATA roots without a drive', { skip: process.platform !== 'win32' }, t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'agy-drive-less-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const bin = join(cwd, 'bin');
+  const appData = join(cwd, 'appdata');
+  writeDecoy(join(bin, 'agy.exe'));
+  writeDecoy(join(appData, 'agy', 'bin', 'agy.exe'));
+  const params = {
+    providerId: 'antigravity-cli',
+    providerOptions: { acpLaunchSpec: { command: 'agy', args: ['acp'], env: {}, displayName: 'Antigravity CLI' } },
+  };
+  const responses = callBridge([
+    { method: 'provider/health', params },
+    { method: 'provider/usage', params },
+    { method: 'provider/usage', params: { providerId: 'antigravity-cli' } },
+  ], {
+    cwd,
+    env: { ...process.env, USERPROFILE: join(cwd, 'host-home'), PATH: bin.slice(2), LOCALAPPDATA: appData.slice(2) },
+  });
+  assert.equal(providerHealthResultSchema.parse(responses.get(0).result).health.status, 'not_installed');
+  assert.deepEqual(responses.get(1).result, { supported: true, usage: { status: 'not_installed' } });
+  assert.deepEqual(responses.get(2).result, responses.get(1).result);
+});
+
 test('provider health uses one version probe and explains when agy is too old', t => {
   const root = mkdtempSync(join(tmpdir(), 'agy-health-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -104,9 +192,7 @@ test('provider health uses one version probe and explains when agy is too old', 
     ['unknown', 'ready'],
     ['unknown', 'not_installed'],
   ];
-  const requests = cases.map(([version, status], id) => JSON.stringify({
-    jsonrpc: '2.0',
-    id,
+  const requests = cases.map(([version, status], id) => ({
     method: 'provider/health',
     params: {
       providerId: 'antigravity-cli',
@@ -120,19 +206,9 @@ test('provider health uses one version probe and explains when agy is too old', 
       },
     },
   }));
-  const fixture = fileURLToPath(new URL('./health-bridge-fixture.mjs', import.meta.url));
-  const run = spawnSync(process.execPath, ['--experimental-strip-types', fixture], {
-    input: requests.join('\n') + '\n', encoding: 'utf8', timeout: 10000, windowsHide: true,
-  });
-  assert.ifError(run.error);
-  assert.equal(run.status, 0, run.stderr);
-  const responses = new Map(run.stdout.trim().split('\n').map(line => {
-    const { id, result } = JSON.parse(line);
-    return [id, result];
-  }));
-  assert.equal(responses.size, cases.length);
+  const responses = callBridge(requests);
   for (const [id, [version, status]] of cases.entries()) {
-    const { health } = providerHealthResultSchema.parse(responses.get(id));
+    const { health } = providerHealthResultSchema.parse(responses.get(id).result);
     assert.equal(health.status, status, JSON.stringify(health));
     assert.equal(health.installedVersion, version === 'unknown' ? null : version);
     assert.equal(health.canUpdate, false);

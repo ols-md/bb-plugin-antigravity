@@ -1,5 +1,6 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import { threadStartParamsSchema, threadResumeParamsSchema, turnStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";
+import type { ProviderHealthResult, ProviderInstallationStatus } from "@get-bb/plugin-sdk/provider-bridge";
 import { createBackgroundTaskTracker, defaultBackgroundTaskStatePath } from "./background-tasks.ts";
 import { ANTIGRAVITY_ACP_DIALECT_ID, applyThreadCommandDescriptions, onToolUpdate, registerAntigravityAcpDialect } from "./dialect.ts";
 import { modeControlOutput } from "./mode-controls.ts";
@@ -42,6 +43,47 @@ function parseUsageRequest(parsed: unknown): { id: string | number; command: str
     cwd: spec.success ? spec.data.cwd : undefined,
     env: spec.success ? spec.data.env : undefined,
   };
+}
+
+function missingCliResponse(method: unknown) {
+  switch (method) {
+    case "provider/health":
+      return { result: {
+        supported: true,
+        health: {
+          status: "not_installed",
+          statusMessage: null,
+          accountEmail: null,
+          planLabel: null,
+          installedVersion: null,
+          minimumSupportedVersion: null,
+          canInstall: false,
+          canUpdate: false,
+          loginCommand: null,
+        },
+      } satisfies ProviderHealthResult };
+    case "provider/usage":
+      return { result: { supported: true, usage: { status: "not_installed" } } };
+    case "provider/installation/status":
+      return { result: {
+        executableName: "agy",
+        executablePath: null,
+        installed: false,
+        installSource: "notInstalled",
+        currentVersion: null,
+        latestVersion: null,
+        minimumSupportedVersion: null,
+        npmPackageName: null,
+        npmGlobalPackageVersion: null,
+        installAction: null,
+        needsUpdate: false,
+        versionUnsupported: false,
+      } satisfies ProviderInstallationStatus };
+    case "provider/installation/run":
+      return { result: { available: false, message: "Antigravity CLI installation and updates are unavailable through BB." } };
+    default:
+      return { error: { code: -32000, message: "Antigravity CLI (agy) was not found on the agent host." } };
+  }
 }
 
 let stdoutFilterInstalled = false;
@@ -157,7 +199,14 @@ export const experimental_providerBridge = {
     ensureStdoutFilter();
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { parsed = null; }
-    resolveAntigravityLaunchSpec(parsed);
+    const request = parsed as { jsonrpc?: unknown; id?: unknown; method?: unknown } | null;
+    if (request?.method !== "initialize" && !resolveAntigravityLaunchSpec(parsed)) {
+      const id = request?.id;
+      if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...missingCliResponse(request.method) })}\n`);
+      }
+      return;
+    }
     if (parsed !== null) line = JSON.stringify(parsed);
     const withDefaults = applyAntigravityDefaults(line, parsed);
     // Runs first: a steer into a held turn is rewritten to turn/start, which the transforms below
