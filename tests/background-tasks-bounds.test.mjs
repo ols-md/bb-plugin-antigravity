@@ -534,3 +534,25 @@ test('synthetic large transcript (16 MiB) stays responsive, bounds memory growth
     `peakHeapDelta=${(peakHeapDelta / (1024 * 1024)).toFixed(2)} MiB peakArrayBuffersDelta=${(peakArrayBuffersDelta / (1024 * 1024)).toFixed(2)} MiB`,
   );
 });
+
+
+test('a plain completion spanning multiple read slices preserves its exit status', async t => {
+  const { transcript, logFor } = createTranscriptFixture(t, 'plain-slices-');
+  const tr = tracker(t, { pollIntervalMs: 5, maxTranscriptReadBytes: 32 });
+  tr.handleToolEventForThread('t', command('conv/build', logFor('build')));
+  appendFileSync(transcript, 'Task id "conv/build" finished with result:\n' + 'details\n'.repeat(100) + 'Command exited with code 5\n');
+  await until(() => tr.getActiveTasks('t').length === 0);
+  assert.equal(tr.async.flatMap(entry => entry.deltas).at(-1).status, 'failed');
+});
+
+test('terminal status survives queue pressure and output truncation', t => {
+  const tr = tracker(t, { maxPendingToolEvents: 4, maxRetainedToolOutputChars: 128 });
+  tr.handleToolEventForThread('t', command('build'));
+  tr.recordToolEvent({
+    toolCallId: 'done', title: 'manage_task', status: 'completed', rawInput: { Action: 'status', TaskId: 'build' },
+    content: 'status: DONE\n' + 'a'.repeat(2048) + ' Command exited with code 5 ' + 'b'.repeat(2048),
+  });
+  for (let n = 0; n < 10; n++) tr.recordToolEvent({ toolCallId: 'noisy', status: 'in_progress', content: String(n) });
+  const deltas = line(tr, 't', { kind: 'item.close', key: { providerItemId: 'done' } });
+  assert.equal(deltas.find(d => d.item?.type === 'backgroundTask')?.status, 'failed');
+});

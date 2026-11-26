@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   experimental_registerAcpDialect,
   type AcpDialect,
@@ -189,7 +190,7 @@ function extractEventOutputText(event: AcpToolUpdateEvent): string {
 // Event hook & deduplication
 type ToolUpdateListener = (event: AcpToolUpdateEvent) => void;
 const toolUpdateListeners = new Set<ToolUpdateListener>();
-const lastNotifiedSteps = new Map<string, { stepKey: string; hasInput: boolean; hasTitle: boolean; outputText: string }>();
+const lastNotifiedSteps = new Map<string, { stepKey: string; hasInput: boolean; hasTitle: boolean; outputDigest: string }>();
 const normalizedExitCodes = new WeakMap< object, number >();
 
 export function onToolUpdate(listener: ToolUpdateListener): () => void {
@@ -213,16 +214,15 @@ function notifyToolUpdate(event: AcpToolUpdateEvent): void {
   const stepKey = `${toolCallId}:${status}`;
   const hasInput = Boolean(event.rawInput && typeof event.rawInput === "object" && Object.keys(event.rawInput).length > 0);
   const hasTitle = typeof event.title === "string" && event.title.length > 0;
-  const outputText = extractEventOutputText(event);
-
   if (toolCallId) {
+    const outputDigest = createHash("sha256").update(extractEventOutputText(event)).digest("base64");
     const prev = lastNotifiedSteps.get(toolCallId);
     if (
       prev &&
       prev.stepKey === stepKey &&
       (prev.hasInput || !hasInput) &&
       (prev.hasTitle || !hasTitle) &&
-      prev.outputText === outputText
+      prev.outputDigest === outputDigest
     ) {
       return;
     }
@@ -233,7 +233,7 @@ function notifyToolUpdate(event: AcpToolUpdateEvent): void {
       stepKey,
       hasInput: Boolean(prev?.hasInput || hasInput),
       hasTitle: Boolean(prev?.hasTitle || hasTitle),
-      outputText,
+      outputDigest,
     });
   }
 

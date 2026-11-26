@@ -17,6 +17,8 @@ export interface RecordedToolEvent {
 }
 interface RetainedToolEvent extends RecordedToolEvent {
   outputTruncated?: boolean;
+  taskStatusFromOutput?: ReturnType<typeof parseTaskStatus>;
+  commandFailed?: boolean;
 }
 export interface BackgroundTask {
   taskId: string;
@@ -191,7 +193,15 @@ function compactRawInput(rawInput: Record<string, unknown> | undefined): Record<
   return Object.keys(compact).length ? compact : undefined;
 }
 
-function compactToolEvent(event: RecordedToolEvent, maxOutputChars: number): RetainedToolEvent {
+function parseTaskStatus(text: string): 'running' | 'failed' | 'interrupted' | 'completed' | undefined {
+  if (/Step is still running|status\s*[:=]\s*RUNNING/i.test(text)) return 'running';
+  if (!/Command exited with code \d+|SCHEDULE_FINISHED|Step was canceled|status\s*[:=]\s*(?:DONE|CANCELED|ERROR|COMPLETED|FAILED|KILLED|STOPPED)|not running|not found|unknown task|finished with result/i.test(text)) return undefined;
+  if (/Command exited with code [1-9]\d*|ERROR|FAILED/i.test(text)) return 'failed';
+  if (/CANCELED|KILLED|interrupted/i.test(text)) return 'interrupted';
+  return 'completed';
+}
+
+function compactToolEvent(event: RetainedToolEvent, maxOutputChars: number): RetainedToolEvent {
   const inferred = inferAntigravityToolName(event as any) ?? undefined;
   const hasOutput = event.content !== undefined || event.rawOutput !== undefined;
   const extracted = hasOutput ? extractToolOutputText(event) : undefined;
@@ -214,7 +224,11 @@ function compactToolEvent(event: RecordedToolEvent, maxOutputChars: number): Ret
     ...(rawInput ? { rawInput } : {}),
     ...(boundedContent !== undefined ? { content: boundedContent } : {}),
     ...(compactOutput !== undefined ? { rawOutput: compactOutput } : {}),
-    ...(outputTruncated ? { outputTruncated: true } : {}),
+    ...(outputTruncated ? {
+      outputTruncated: true,
+      taskStatusFromOutput: event.outputTruncated ? event.taskStatusFromOutput : parseTaskStatus(extracted ?? ''),
+      commandFailed: event.outputTruncated ? event.commandFailed : /command exited with code [1-9]\d*/i.test(extracted ?? ''),
+    } : {}),
   };
 }
 
@@ -229,6 +243,8 @@ function mergeToolEvent(previous: RetainedToolEvent | undefined, event: Retained
     rawInput: previous?.rawInput && event.rawInput ? { ...previous.rawInput, ...event.rawInput } : event.rawInput ?? previous?.rawInput,
     rawOutput: event.rawOutput ?? previous?.rawOutput,
     content: event.content ?? previous?.content,
+    taskStatusFromOutput: hasNewOutput ? event.taskStatusFromOutput : previous?.taskStatusFromOutput,
+    commandFailed: hasNewOutput ? event.commandFailed : previous?.commandFailed,
     outputTruncated: hasNewOutput ? event.outputTruncated : previous?.outputTruncated,
   };
 }
@@ -435,6 +451,7 @@ export function createBackgroundTaskTracker(options: {
     pending?: PendingAnnouncement;
   }
   interface TranscriptWatcherState {
+    plainScan?: StreamingScanState;
     offset: number;
     partial: string;
     oversizedLine: boolean;
@@ -833,14 +850,17 @@ export function createBackgroundTaskTracker(options: {
     path: string,
     state: TranscriptWatcherState,
     chunk: string,
+    remaining: boolean,
   ): BackgroundTaskDelta[] {
     const deltas: BackgroundTaskDelta[] = [];
     const plainLines: string[] = [];
-    const flushPlain = () => {
-      if (!plainLines.length) return;
-      const block = plainLines.join('\n');
+    const flushPlain = (final = true) => {
+      if (!plainLines.length && !state.plainScan) return;
+      const scan = state.plainScan ??= { buffer: '' };
+      const block = plainLines.length ? plainLines.join('\n') + '\n' : '';
       plainLines.length = 0;
-      if (block) deltas.push(...inspectTextForCompletions(thread, block));
+      deltas.push(...feedStreamingCompletions(thread, scan, block, final, maxLineChars, lineOverlap));
+      if (final) state.plainScan = undefined;
     };
     let pos = 0;
     while (pos < chunk.length) {
@@ -894,7 +914,7 @@ export function createBackgroundTaskTracker(options: {
           if (COMPLETION_HINT.test(line)) {
             deltas.push(...inspectTextForCompletions(thread, unescapeOversizedText(line)));
           }
-        } else if (plainLines.length > 0 || COMPLETION_HINT.test(line)) {
+        } else if (state.plainScan || plainLines.length > 0 || COMPLETION_HINT.test(line)) {
           // Transcript records encode message text as JSON strings.
           let parsed: unknown;
           let isJson = false;
@@ -910,7 +930,7 @@ export function createBackgroundTaskTracker(options: {
         }
       }
     }
-    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain();
+    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain(!remaining && !state.partial);
     return deltas;
   }
   function scheduleCatchUp() {
@@ -939,6 +959,7 @@ export function createBackgroundTaskTracker(options: {
           state.oversizedLine = false;
           state.oversizedBackslash = '';
           state.oversizedScan = undefined;
+          state.plainScan = undefined;
           state.decoder = new StringDecoder('utf8');
         }
         if (size > state.offset) {
@@ -952,14 +973,14 @@ export function createBackgroundTaskTracker(options: {
       } catch { /* The CLI may not have created the transcript yet. */ }
       finally { if (fd !== undefined) closeSync(fd); }
       if (chunk) {
-        const deltas = consumeTranscriptChunk(thread, path, state, chunk);
+        const deltas = consumeTranscriptChunk(thread, path, state, chunk, remaining);
         if (deltas.length) options.onAsyncDeltas?.(thread, deltas);
       }
       if (remaining && !disposed && watchers.get(thread)?.get(path) === state) hasMore = true;
     }
     if (hasMore) scheduleCatchUp();
   }
-  function handleToolEventForThread(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+  function handleToolEventForThread(thread: string, event: RetainedToolEvent): BackgroundTaskDelta[] {
     if (disposed) return [];
     // A failed run_command event with empty/whitespace output is the exact signature of the
     // "silent give-up" turn: record it even though no background task is registered for it.
@@ -982,10 +1003,9 @@ export function createBackgroundTaskTracker(options: {
     if (name === 'manage_task') {
       const id = first(input.TaskId);
       if (action === 'kill' && id) return settle(thread, id, 'interrupted', 'killed', text, 'local_bash');
-      if (action === 'status' && id && !/Step is still running|status\s*[:=]\s*RUNNING/i.test(text) && /Command exited with code \d+|SCHEDULE_FINISHED|Step was canceled|status\s*[:=]\s*(?:DONE|CANCELED|ERROR|COMPLETED|FAILED|KILLED|STOPPED)|not running|not found|unknown task|finished with result/i.test(text)) {
-        const failed = /Command exited with code [1-9]\d*|ERROR|FAILED/i.test(text);
-        const killed = /CANCELED|KILLED|interrupted/i.test(text);
-        return settle(thread, id, failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', text, 'local_bash');
+      if (action === 'status' && id) {
+        const status = event.outputTruncated ? event.taskStatusFromOutput : parseTaskStatus(text);
+        if (status && status !== 'running') return settle(thread, id, status, status === 'interrupted' ? 'killed' : status, text, 'local_bash');
       }
       if (action === 'list' && !outputTruncated && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
         for (const task of getActiveTasks(thread)) {
@@ -1055,11 +1075,11 @@ export function createBackgroundTaskTracker(options: {
       ...(input.IsDaemon === true || input.IsDaemon === 'true' ? { daemon: true } : {}),
     });
   }
-  function settleOrphanCommand(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+  function settleOrphanCommand(thread: string, event: RetainedToolEvent): BackgroundTaskDelta[] {
     const task = threads.get(thread)?.get(taskKey({ taskType: 'local_bash', taskId: event.toolCallId }));
     if (!task?.orphan || !TERMINAL_TOOL_STATUS.test(event.status ?? '')) return [];
     const text = extractToolOutputText(event).trim();
-    const failed = event.status === 'failed' || /(?:The c|C)ommand exited with code [1-9]\d*/.test(text);
+    const failed = event.status === 'failed' || (event.outputTruncated ? event.commandFailed : /command exited with code [1-9]\d*/i.test(text));
     const killed = !failed && /cancel/i.test(event.status ?? '');
     return settle(thread, task.taskId, failed ? 'failed' : killed ? 'interrupted' : 'completed',
       failed ? 'failed' : killed ? 'killed' : 'completed', text || undefined, 'local_bash');
@@ -1313,12 +1333,23 @@ export function createBackgroundTaskTracker(options: {
       pending.set(compacted.toolCallId, queue);
       pendingCount += 1;
       while (pendingCount > maxPendingEvents) {
-        const oldestKey = pending.keys().next().value;
-        if (oldestKey === undefined) break;
-        const oldestQueue = pending.get(oldestKey)!;
-        oldestQueue.shift();
+        // Keep terminal updates available for correlation when one noisy call floods the queue.
+        let evicted = false;
+        for (const [key, events] of pending) {
+          const index = events.findIndex(update => !TERMINAL_TOOL_STATUS.test(update.status ?? ''));
+          if (index < 0) continue;
+          events.splice(index, 1);
+          if (!events.length) pending.delete(key);
+          evicted = true;
+          break;
+        }
+        if (!evicted) {
+          const first = pending.entries().next().value;
+          if (!first) break;
+          first[1].shift();
+          if (!first[1].length) pending.delete(first[0]);
+        }
         pendingCount -= 1;
-        if (!oldestQueue.length) pending.delete(oldestKey);
       }
     },
     handleToolEventForThread,
