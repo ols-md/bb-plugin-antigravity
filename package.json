@@ -17,6 +17,7 @@
     "server.ts",
     "host.ts",
     "cli.ts",
+    "compaction.ts",
     "background-tasks.ts",
     "subagents.ts",
     "dialect.ts",

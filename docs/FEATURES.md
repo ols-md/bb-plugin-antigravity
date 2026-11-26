@@ -22,7 +22,7 @@ Signed-in validation of the released plugin on a Linux agent host remains open. 
 | Separate child sessions | Distinct ACP session IDs verified; actual concurrent agent work not tested |
 | Existing session load | Native session/load verified; full BB restart recovery not tested |
 | Session fork/rewind | Disabled: CLI initialize does not advertise session/fork |
-| Manual compaction | Disabled. On Windows, CLI 1.5.18 ended the `/compact` turn without a compaction result in both an empty session and a resumed session with history. The empty session also displayed a quota warning. Enable this capability only when the CLI confirms that compaction completed. |
+| Manual compaction | Run `/compact` after a conversation turn. The bridge checks the local CLI transcript for a new system checkpoint before it reports success. Verified with CLI 1.5.18 on Windows. |
 | Subscription quota/usage | Supported via `agy -p "/usage" --output-format json` and `provider-usage.v1` |
 | Native archive/rename | Disabled: bridge does not implement these operations |
 | BB Auto permission profile | Unsupported by the shared ACP bridge |

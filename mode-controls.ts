@@ -16,9 +16,10 @@ function workModes(options: NonNullable<AvailableModel["sessionOptions"]>) {
   });
 }
 
-export function presentProviderOutput(line: string): string {
+export function presentProviderOutput(line: string, verify?: (message: unknown) => void): string {
   let message;
   try { message = JSON.parse(line); } catch { return line; }
+  verify?.(message);
   // The shared bridge already ran the version probe for provider/health.
   if (message?.jsonrpc === "2.0") addAntigravityHealthDiagnostic(message.result);
   if (Array.isArray(message?.result?.models)) {
@@ -38,11 +39,12 @@ export function presentProviderOutput(line: string): string {
 export function modeControlOutput(
   intercept?: (line: string) => boolean,
   transformLines?: (line: string) => string[],
+  verify?: (message: unknown) => void,
 ) {
   const decoder = new StringDecoder("utf8");
   let pending = "";
   const emit = (stream: Transform, line: string, trailingNewline: boolean) => {
-    const presented = presentProviderOutput(line);
+    const presented = presentProviderOutput(line, verify);
     const lines = transformLines ? transformLines(presented) : [presented];
     for (const out of lines) {
       stream.push(trailingNewline ? `${out}\n` : out);

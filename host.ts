@@ -8,10 +8,12 @@ import { mapPromptMode } from "./prompt-mode.ts";
 import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
 import { resolveAntigravityLaunchSpec } from "./cli.ts";
+import { createCompactionVerifier } from "./compaction.ts";
 
 registerAntigravityAcpDialect();
 
 let rawStdoutWrite: typeof process.stdout.write | null = null;
+const compaction = createCompactionVerifier();
 export const backgroundTaskTracker = createBackgroundTaskTracker({
   persistPath: defaultBackgroundTaskStatePath(),
   onAsyncDeltas(threadId, deltas) {
@@ -184,6 +186,7 @@ function ensureStdoutFilter() {
   const output = modeControlOutput(
     interceptApproval,
     line => backgroundTaskTracker.processStdoutLine(applyThreadCommandDescriptions(line, commandDescriptionsThreads)),
+    compaction.verify,
   );
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
@@ -245,6 +248,11 @@ export const experimental_providerBridge = {
         };
         process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: usageRequest.id, result })}\n`);
       });
+      return;
+    }
+    const compactError = compaction.prepare(subagentTransformed.parsed);
+    if (compactError) {
+      process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request?.id, error: { code: -32000, message: compactError } })}\n`);
       return;
     }
     experimental_acpProviderBridge.handleLine(mapPromptMode(subagentTransformed.line, subagentTransformed.parsed));
