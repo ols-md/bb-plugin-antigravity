@@ -4,15 +4,26 @@
 
 <h1 align="center">Antigravity CLI for BB</h1>
 
-<p align="center">
-  <a href="#getting-started">Getting started</a> &middot;
-  <a href="#modes-and-permissions">Modes & permissions</a> &middot;
-  <a href="SECURITY.md">Security</a>
-</p>
+[![Latest GitHub release](https://img.shields.io/github/v/release/ols-md/bb-plugin-antigravity)](https://github.com/ols-md/bb-plugin-antigravity/releases/latest)
+[![Public repository checks on main](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml)
+[![MIT license](https://img.shields.io/github/license/ols-md/bb-plugin-antigravity)](LICENSE)
 
-Use your installed Antigravity CLI and existing sign-in to work in [BB](https://getbb.app). Choose an available model, work in Build or Plan mode, and review tool approval requests in BB.
+Plan and code in [BB](https://getbb.app) with your installed Google Antigravity CLI and existing sign-in.
 
-This experimental provider is available in the BB Community marketplace. It has been tested on Windows. macOS and Linux still need validation.
+**[Install from the BB Community marketplace](https://getbb.app/marketplace/antigravity-cli)** · [Setup](#getting-started) · [Contribute](#development) · [Security](SECURITY.md)
+
+**Experimental.** Tested on Windows. macOS and Linux still need validation.
+
+- Choose an available model and reasoning level in the BB provider picker.
+- Use the CLI's native Plan mode to outline a task. Switch to Build to implement it.
+- Review tool approval requests in BB with the default permission settings.
+- See quota used and reset times in the usage sidebar and in **Settings → Usage limits** when the CLI reports them.
+
+## Preview
+
+![Antigravity CLI in BB showing the model picker and reasoning levels, quota used and reset times by model group, and provider settings for visibility, automatic approvals, terminal sandboxing, subagents, and command descriptions.](assets/screenshots/marketplace-overview.png)
+
+The preview shows example settings. Available models and reasoning levels can depend on your Antigravity account, CLI version, and plugin version. [View the preview at full size](assets/screenshots/marketplace-overview.png?raw=true)
 
 ## Getting started
 
@@ -66,14 +77,6 @@ Plugins run with full trust. Review BB's installation prompt. If you trust the p
 2. Select an available model. If the model offers reasoning levels, select a level.
 3. In the **Mode** selector, select **Build** to implement a task or **Plan** to outline it. See [Modes and permissions](#modes-and-permissions).
 4. Send a prompt.
-
-## Preview
-
-![Antigravity CLI in BB showing the model picker and reasoning levels, quota used and reset times by model group, and provider settings for visibility, automatic approvals, terminal sandboxing, subagents, and command descriptions.](assets/screenshots/marketplace-overview.png)
-
-The preview shows example settings. Available models and reasoning levels can depend on your Antigravity account, CLI version, and plugin version. [View the preview at full size](assets/screenshots/marketplace-overview.png?raw=true)
-
-When the CLI reports quota used and reset times, BB shows them in the usage sidebar and in **Settings → Usage limits**.
 
 ## How it works
 
@@ -168,13 +171,40 @@ For future terminals, add `%LOCALAPPDATA%\agy\bin` to your user **Path** in Wind
 
 ## Development
 
-The test runner requires Node.js 22.18+ or Node.js 24.
+Contributions are welcome. Choose a starting point for your change.
+
+- **Validate macOS or Linux.** Install the plugin from the marketplace. Sign in to the CLI. In BB, select a model and try both Plan and Build. Remove private data from your logs. Report your OS, BB version, CLI version, and results in [GitHub Issues](https://github.com/ols-md/bb-plugin-antigravity/issues).
+- **Improve CLI setup or diagnostics.** Start with [CLI discovery and health checks](cli.ts) and [CLI tests](tests/cli.test.mjs).
+- **Improve Plan and Build.** Start with [mode controls](mode-controls.ts) and [mode tests](tests/mode-controls.test.mjs).
+- **Improve quota reporting.** Start with [usage reporting](usage.ts) and [usage tests](tests/usage.test.mjs).
+
+Read the [Antigravity contributor guide](.bb/skills/antigravity-contributor/SKILL.md) and the [security checks for contributions](SECURITY.md#public-contribution-and-release-checks). If you suspect a vulnerability, follow the private reporting instructions in [SECURITY.md](SECURITY.md).
+
+### Repository checks
+
+The test runner requires Node.js 22.18+ or Node.js 24. Run these commands from the repository root.
 
 ```sh
 npm ci --ignore-scripts
 npm run check
 npm test
+npm audit --audit-level=low
+npm pack --dry-run --ignore-scripts
+```
+
+[GitHub Actions](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml) runs these checks on pull requests and scans Git history for secrets with Gitleaks.
+
+### Local build and CLI smoke checks
+
+If BB is available on your machine, build the plugin locally.
+
+```sh
 npm run build
+```
+
+If you are signed in to the Antigravity CLI on a trusted machine, run the smoke check.
+
+```sh
 npm run smoke -- --modes
 ```
 
