@@ -18,7 +18,7 @@ The contributor in issue #29 reported tests on Unraid with Node.js 26 and Antigr
 | Separate child sessions | Distinct ACP session IDs verified; actual concurrent agent work not tested |
 | Existing session load | Native session/load verified; full BB restart recovery not tested |
 | Session fork/rewind | Disabled: CLI initialize does not advertise session/fork |
-| Manual compaction | Disabled. On Windows, CLI 1.5.18 ended the `/compact` turn without a compaction result in both an empty session and a resumed session with history. The empty session also displayed a quota warning. BB needs a completion signal before it can report success. |
+| Manual compaction | Disabled. On Windows, CLI 1.5.18 ended the `/compact` turn without a compaction result in both an empty session and a resumed session with history. The empty session also displayed a quota warning. Enable this capability only when the CLI confirms that compaction completed. |
 | Subscription quota/usage | Supported via `agy -p "/usage" --output-format json` and `provider-usage.v1` |
 | Native archive/rename | Disabled: bridge does not implement these operations |
 | BB Auto permission profile | Unsupported by the shared ACP bridge |
