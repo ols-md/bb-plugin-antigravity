@@ -9,9 +9,11 @@ import { providerHealthResultSchema, providerInstallationStatusSchema } from '@g
 import { resolveAntigravityCommand, resolveAntigravityLaunchSpec } from '../cli.ts';
 import { readAntigravityProviderUsage } from '../usage.ts';
 
-function callBridge(requests, options) {
+function callBridge(requests, { defaultTaskState = false, ...options } = {}) {
   const fixture = fileURLToPath(new URL('./health-bridge-fixture.mjs', import.meta.url));
-  const run = spawnSync(process.execPath, ['--experimental-strip-types', fixture], {
+  const args = ['--experimental-strip-types', fixture];
+  if (defaultTaskState) args.push('--default-task-state');
+  const run = spawnSync(process.execPath, args, {
     ...options,
     input: requests.map((request, id) => JSON.stringify({ jsonrpc: '2.0', id, ...request })).join('\n') + '\n',
     encoding: 'utf8', timeout: 10000, windowsHide: true,
@@ -172,6 +174,43 @@ test('the bridge skips Windows PATH and LOCALAPPDATA roots without a drive', { s
   assert.equal(providerHealthResultSchema.parse(responses.get(0).result).health.status, 'not_installed');
   assert.deepEqual(responses.get(1).result, { supported: true, usage: { status: 'not_installed' } });
   assert.deepEqual(responses.get(2).result, responses.get(1).result);
+});
+
+test('a bare Windows USERPROFILE drive does not prevent ACP launch and usage replies', { skip: process.platform !== 'win32' }, t => {
+  const cwd = mkdtempSync(join(tmpdir(), 'agy-home-drive-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  writeDecoy(join(cwd, 'agy.exe'));
+  const providerOptions = { acpLaunchSpec: { command: 'agy', args: ['acp'], env: {}, displayName: 'Antigravity CLI' } };
+  const envVars = { PATH: cwd };
+  const requests = [
+    { method: 'thread/start', params: {
+      threadId: 'thread', cwd, instructionMode: 'append',
+      options: {
+        permissionMode: 'accept-edits', permissionScope: 'workspace', approvalReviewer: 'user',
+        permissionEscalation: 'ask', providerOptions, envVars,
+      },
+    } },
+    { method: 'provider/usage', params: { providerId: 'antigravity-cli', providerOptions, envVars } },
+    { method: 'provider/usage', params: { providerId: 'antigravity-cli', envVars } },
+  ];
+  for (const appData of ['', join(cwd, 'host-appdata')]) {
+    const env = {
+      ...process.env,
+      BB_ANTIGRAVITY_TASK_STATE_DIR: '',
+      PATH: 'bin',
+      USERPROFILE: parse(cwd).root.slice(0, 2),
+      LOCALAPPDATA: appData,
+    };
+    const responses = callBridge(requests, { cwd, env, defaultTaskState: true });
+    const { error } = responses.get(0);
+    if (appData) {
+      assert.ok(error?.message.includes(join(appData, 'agy', 'bin', 'agy.exe')), JSON.stringify(error));
+    } else {
+      assert.deepEqual(error, { code: -32000, message: 'Antigravity CLI (agy) was not found on the agent host.' });
+    }
+    assert.deepEqual(responses.get(1).result, { supported: true, usage: { status: 'not_installed' } });
+    assert.deepEqual(responses.get(2).result, responses.get(1).result);
+  }
 });
 
 test('provider health uses one version probe and explains when agy is too old', t => {

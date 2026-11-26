@@ -13,13 +13,24 @@ function windowsEnvKey(env: NodeJS.ProcessEnv, name: string): string {
   return Object.keys(env).find(key => key.toUpperCase() === name) ?? name;
 }
 
+export function hostHomeDirectory(): string | undefined {
+  try {
+    const home = homedir();
+    return isFullyQualified(home) ? home : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function installerPath(env: NodeJS.ProcessEnv): string | null {
-  const home = homedir();
-  if (process.platform !== "win32") return isFullyQualified(home) ? join(home, ".local", "bin", "agy") : null;
-  const localAppData = env[windowsEnvKey(env, "LOCALAPPDATA")];
-  const root = isFullyQualified(localAppData) ? localAppData
-    : isFullyQualified(home) ? join(home, "AppData", "Local") : null;
-  return root === null ? null : join(root, "agy", "bin", "agy.exe");
+  const windows = process.platform === "win32";
+  if (windows) {
+    const localAppData = env[windowsEnvKey(env, "LOCALAPPDATA")];
+    if (isFullyQualified(localAppData)) return join(localAppData, "agy", "bin", "agy.exe");
+  }
+  const home = hostHomeDirectory();
+  if (home === undefined) return null;
+  return windows ? join(home, "AppData", "Local", "agy", "bin", "agy.exe") : join(home, ".local", "bin", "agy");
 }
 
 const MIN_AGY_ACP_VERSION = "1.5.0";
@@ -39,10 +50,11 @@ export function addAntigravityHealthDiagnostic(result: ProviderHealthResult | un
 export function resolveAntigravityCommand(command: string, options?: { cwd?: string; env?: NodeJS.ProcessEnv }): string | null {
   if (command !== "agy") return experimental_hostToolchain.resolve(command, options);
   let env = options?.env ?? process.env;
-  if (process.platform === "win32") {
-    const profileKey = windowsEnvKey(env, "USERPROFILE");
-    // The SDK joins home-based PATH entries, which can turn a bare drive into a drive root.
-    if (!isFullyQualified(env[profileKey] ?? homedir())) env = { ...env, [profileKey]: "" };
+  const homeKey = process.platform === "win32" ? windowsEnvKey(env, "USERPROFILE") : "HOME";
+  if (!isFullyQualified(env[homeKey])) {
+    // An empty value prevents the SDK from rediscovering home or expanding a bare drive.
+    const home = env[homeKey] === undefined ? hostHomeDirectory() : undefined;
+    env = { ...env, [homeKey]: home ?? "" };
   }
   const hostPath = experimental_hostToolchain.environment(env).PATH ?? "";
   // Windows bare-name lookup starts in cwd. Search the host PATH explicitly.

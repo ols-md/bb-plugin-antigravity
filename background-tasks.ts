@@ -1,8 +1,8 @@
 import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { StringDecoder } from 'node:string_decoder';
+import { hostHomeDirectory } from './cli.ts';
 import { inferAntigravityToolName } from './dialect.ts';
 
 export interface RecordedToolEvent {
@@ -344,10 +344,11 @@ function mergeToolEvent(previous: RetainedToolEvent | undefined, event: Retained
  */
 const DEFAULT_TASK_STATE_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 
-export function defaultBackgroundTaskStatePath(): string {
+export function defaultBackgroundTaskStatePath(): string | undefined {
   const override = process.env.BB_ANTIGRAVITY_TASK_STATE_DIR?.trim();
-  const dir = override || join(homedir(), '.bb', 'plugin-data', 'bb-plugin-antigravity');
-  return join(dir, 'background-tasks.json');
+  if (override) return join(override, 'background-tasks.json');
+  const home = hostHomeDirectory();
+  return home === undefined ? undefined : join(home, '.bb', 'plugin-data', 'bb-plugin-antigravity', 'background-tasks.json');
 }
 
 const LOCK_MARKER_PATTERN = /^(\d+)-[0-9a-f-]+\.lock$/i;
