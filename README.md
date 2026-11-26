@@ -4,79 +4,76 @@
 
 <h1 align="center">Antigravity CLI for BB</h1>
 
-<p align="center">Use your Antigravity CLI account to code in BB.</p>
-
 <p align="center">
   <a href="#getting-started">Getting started</a> &middot;
   <a href="#modes-and-permissions">Modes & permissions</a> &middot;
   <a href="SECURITY.md">Security</a>
 </p>
 
-An experimental community provider that connects [BB](https://getbb.app) to the [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli). Keep your existing CLI sign-in, choose available models, and work with streamed responses and tool approvals inside BB.
+Use your installed Antigravity CLI and existing sign-in to work in [BB](https://getbb.app). Choose an available model, work in Build or Plan mode, and review tool approval requests in BB.
 
-**Status:** available in the BB Community marketplace and tested on Windows. macOS and Linux still need validation.
+This experimental provider is available in the BB Community marketplace. It has been tested on Windows. macOS and Linux still need validation.
 
 ## Getting started
 
 ### 1. Prepare the agent host
 
-You need BB 0.48+, Node.js 22+, and a separately installed Antigravity CLI with an eligible account. The Antigravity desktop application alone is insufficient. Your provider's quota and charges still apply.
+You need BB 0.48 or later, Node.js 22 or later, and an eligible Antigravity account. Antigravity quota and charges apply.
 
-Run these commands on the machine where the agent will execute:
+Install the standalone Antigravity CLI (`agy`) on the machine where the agent runs. If you use a remote agent host, install it there. [Google's CLI installation instructions](https://antigravity.google/docs/getting-started?tab=cli)
+
+Check the CLI version and ACP support on the agent host.
 
 ```sh
 agy --version
 agy acp --help
 ```
 
-Sign in if needed:
+If you need to sign in, run this command on the agent host.
 
 ```sh
 agy acp --login
 ```
 
-The plugin checks `PATH`, then the standard CLI installer location on the agent host (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows or `~/.local/bin/agy` on macOS/Linux). Remote agent hosts need their own CLI installation and sign-in.
+Follow the sign-in prompts. The plugin checks `PATH` first, then the standard CLI install location (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows or `~/.local/bin/agy` on macOS and Linux).
 
 ### 2. Install the plugin
 
-Install from the BB Community marketplace:
+In BB, open **Plugins** from the navigation rail. In the Community marketplace, find **Antigravity CLI [Experimental]** and select **Install**. You can also install it from the command line.
 
 ```sh
 bb plugin install antigravity-cli
 ```
 
-Alternatively, install **Antigravity CLI** from **Settings -> Plugins** in BB, or install directly from the [GitHub repository](https://github.com/ols-md/bb-plugin-antigravity):
+To install from the default branch on GitHub, run this command.
 
 ```sh
 bb plugin install https://github.com/ols-md/bb-plugin-antigravity
 ```
 
-To install from a local checkout, run inside the plugin directory:
+To install from a local checkout, run these commands in the plugin directory.
 
 ```sh
 npm ci --ignore-scripts
 bb plugin install .
 ```
 
-Review and accept BB's installation prompt. Plugins run with full trust. The GitHub URL tracks the default branch. Release and marketplace information is documented in [docs/RELEASE.md](docs/RELEASE.md).
+Plugins run with full trust. Review BB's installation prompt. If you trust the plugin, accept the prompt. For release and marketplace information, see the [release guide](docs/RELEASE.md).
 
 ### 3. Start a thread
 
-Select **Antigravity CLI** in BB's provider picker, choose a model, and send a prompt. The CLI supplies the available models; availability depends on your account and installed version.
+1. Select **Antigravity CLI** in BB's provider picker for a new thread.
+2. Select an available model. If the model offers reasoning levels, select a level.
+3. In the **Mode** selector, select **Build** to implement a task or **Plan** to outline it. See [Modes and permissions](#modes-and-permissions).
+4. Send a prompt.
 
 ## Preview
 
-<p align="center">
-  <img src="assets/screenshots/model-picker.png" width="281" alt="Antigravity model picker in BB, showing available models and Low, Medium, and High reasoning choices">
-</p>
+![Antigravity CLI in BB showing the model picker and reasoning levels, quota used and reset times by model group, and provider settings for visibility, automatic approvals, terminal sandboxing, subagents, and command descriptions.](assets/screenshots/marketplace-overview.png)
 
-Choose a model and reasoning level from BB's conversation picker. Available models and options depend on your CLI version and account.
+The preview shows example settings. Available models and reasoning levels can depend on your Antigravity account, CLI version, and plugin version. [View the preview at full size](assets/screenshots/marketplace-overview.png?raw=true)
 
-<p align="center">
-  <img src="assets/screenshots/usage.png" width="380" alt="Antigravity CLI quota and usage windows in BB's sidebar usage panel">
-</p>
-
-The percentage shows how much quota each group has used. The time at the right shows when its window resets. Open the sidebar or **Settings -> Usage limits**.
+When the CLI reports quota used and reset times, BB shows them in the usage sidebar and in **Settings → Usage limits**.
 
 ## How it works
 
