@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, renameSync, rmdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, readdirSync, utimesSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, openSync, closeSync, renameSync, rmdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, readdirSync, utimesSync, existsSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -719,6 +719,396 @@ test('live lock markers are never evicted by age and yielding removes only the c
   unlinkSync(liveMarker);
   assert.deepEqual(withTaskStateLock(path, () => 'acquired-ok'), { status: 'acquired', value: 'acquired-ok' });
   assert.deepEqual(readdirSync(lockDir), []);
+});
+
+const fsError = (code, message = code) => Object.assign(new Error(message), { code });
+const drainTimers = (t, steps = 40, stepMs = 1_000) => { for (let i = 0; i < steps; i++) t.mock.timers.tick(stepMs); };
+
+test('transient startup reads retry and populate restart inventory and stale-record GC', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(Math, 'random', () => 0);
+  const path = statePath(t);
+  const now = Date.now();
+  writeFileSync(path, `${JSON.stringify({
+    version: 1,
+    tasks: [
+      { threadId: 'stale', taskId: 'expired-1', taskType: 'local_bash', description: 'old', parentToolCallId: 'call:expired-1', startedAt: now - 10 * 24 * 60 * 60 * 1000 },
+      { threadId: 'legacy', taskId: 'old-1', taskType: 'local_bash', description: 'build', parentToolCallId: 'call:old-1', startedAt: now - 1_000 },
+    ],
+  })}\n`);
+
+  let readFailures = ['EBUSY', 'EPERM'];
+  let readAttempts = 0;
+  const taskStateFs = {
+    readFileSync(filePath, options) {
+      if (filePath === path) {
+        readAttempts += 1;
+        const code = readFailures.shift();
+        if (code) throw fsError(code);
+      }
+      return readFileSync(filePath, options);
+    },
+  };
+
+  const restarted = tracker(t, { persistPath: path, taskStateFs });
+  assert.equal(readAttempts, 1);
+  // First retry hits EPERM; second retry succeeds and populates initialRecords + GCs stale record.
+  t.mock.timers.tick(10);
+  assert.equal(readAttempts, 2);
+  t.mock.timers.tick(20);
+  assert.equal(readAttempts, 3);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId), ['old-1']);
+
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'stale' } }), []);
+  const closes = restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'legacy' } });
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0].kind, 'item.close');
+  assert.equal(closes[0].status, 'interrupted');
+  assert.equal(closes[0].item.taskStatus, 'stopped');
+  assert.equal(closes[0].key.providerItemId, 'task:old-1');
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks, []);
+});
+
+test('resume during transient read reconciles safely and emits closes while preserving subsequent host handoffs', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(Math, 'random', () => 0);
+
+  // Case A: startup read succeeded, then thread/resume hits a transient read while another host takes over.
+  const pathA = statePath(t);
+  const nowA = Date.now();
+  writeFileSync(pathA, `${JSON.stringify({
+    version: 1,
+    tasks: [
+      { threadId: 'thread', taskId: 'old-1', taskType: 'local_bash', description: 'build-1', parentToolCallId: 'call:old-1', startedAt: nowA },
+      { threadId: 'thread', taskId: 'old-2', taskType: 'local_bash', description: 'build-2', parentToolCallId: 'call:old-2', startedAt: nowA },
+    ],
+  })}\n`);
+
+  let blockReadA = false;
+  const emittedA = [];
+  const restartedA = tracker(t, {
+    persistPath: pathA,
+    onAsyncDeltas: (threadId, deltas) => emittedA.push({ threadId, deltas }),
+    taskStateFs: {
+      readFileSync(filePath, options) {
+        if (blockReadA && filePath === pathA) throw fsError('EPERM');
+        return readFileSync(filePath, options);
+      },
+    },
+  });
+
+  blockReadA = true;
+  assert.deepEqual(restartedA.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.equal(emittedA.length, 0);
+
+  // Subsequent host handoff replaces old-2 and adds a new task on the same thread before retry runs.
+  const handoffA = tracker(t, { persistPath: pathA });
+  handoffA.handleToolEventForThread('thread', command('old-2', { toolCallId: 'call:handoff-2' }));
+  handoffA.handleToolEventForThread('thread', command('handoff-new', { toolCallId: 'call:handoff-new' }));
+
+  blockReadA = false;
+  t.mock.timers.tick(10);
+  assert.equal(emittedA.length, 1);
+  assert.equal(emittedA[0].threadId, 'thread');
+  assert.deepEqual(emittedA[0].deltas.map(d => [d.key.providerItemId, d.status, d.item.taskStatus]), [
+    ['task:old-1', 'interrupted', 'stopped'],
+  ]);
+  const savedA = JSON.parse(readFileSync(pathA, 'utf8')).tasks;
+  assert.deepEqual(savedA.map(task => [task.taskId, task.parentToolCallId]).sort(), [
+    ['handoff-new', 'call:handoff-new'],
+    ['old-2', 'call:handoff-2'],
+  ]);
+  // Re-ticking and a later resume must not double-emit or touch handoff records.
+  drainTimers(t, 10, 1_000);
+  assert.equal(emittedA.length, 1);
+  assert.deepEqual(restartedA.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.equal(JSON.parse(readFileSync(pathA, 'utf8')).tasks.length, 2);
+
+  // Case B: startup read itself failed transiently, resume arrives during transient read, and a handoff starts afterward.
+  let fakeNow = 10_000;
+  t.mock.method(Date, 'now', () => fakeNow);
+  const pathB = statePath(t);
+  writeFileSync(pathB, `${JSON.stringify({
+    version: 1,
+    tasks: [
+      { threadId: 'thread', taskId: 'pre-restart', taskType: 'local_bash', description: 'legacy', parentToolCallId: 'call:pre', startedAt: fakeNow },
+    ],
+  })}\n`);
+
+  fakeNow = 20_000;
+  let blockReadB = true;
+  const emittedB = [];
+  const restartedB = tracker(t, {
+    persistPath: pathB,
+    onAsyncDeltas: (threadId, deltas) => emittedB.push({ threadId, deltas }),
+    taskStateFs: {
+      readFileSync(filePath, options) {
+        if (blockReadB && filePath === pathB) throw fsError('EBUSY');
+        return readFileSync(filePath, options);
+      },
+    },
+  });
+  assert.deepEqual(restartedB.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.equal(emittedB.length, 0);
+
+  fakeNow = 20_050;
+  const handoffB = tracker(t, { persistPath: pathB });
+  handoffB.handleToolEventForThread('thread', command('after-handoff', { toolCallId: 'call:after' }));
+
+  blockReadB = false;
+  t.mock.timers.tick(10);
+  assert.equal(emittedB.length, 1);
+  assert.equal(emittedB[0].threadId, 'thread');
+  assert.deepEqual(emittedB[0].deltas.map(d => [d.key.providerItemId, d.status, d.item.taskStatus]), [
+    ['task:pre-restart', 'interrupted', 'stopped'],
+  ]);
+  const savedB = JSON.parse(readFileSync(pathB, 'utf8')).tasks;
+  assert.deepEqual(savedB.map(task => [task.taskId, task.parentToolCallId]), [
+    ['after-handoff', 'call:after'],
+  ]);
+});
+
+test('fresh same-millisecond replacement wins against old while delayed add retry preserves already-saved replacement', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(Math, 'random', () => 0);
+  t.mock.method(Date, 'now', () => 12345);
+  const path = statePath(t);
+
+  // 1. Fresh replacement with a different parentToolCallId in the same ms overwrites the old saved record.
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('thread', command('same', { toolCallId: 'call:old' }));
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks[0].parentToolCallId, 'call:old');
+
+  const second = tracker(t, { persistPath: path });
+  second.handleToolEventForThread('thread', command('same', { toolCallId: 'call:fresh-replacement' }));
+  assert.deepEqual(
+    JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => [task.taskId, task.parentToolCallId]),
+    [['same', 'call:fresh-replacement']],
+  );
+
+  // 2. A delayed add retry (queued after a transient write failure) preserves an already-saved same-ms replacement.
+  let failRenameOnce = true;
+  const third = tracker(t, {
+    persistPath: path,
+    taskStateFs: {
+      renameSync(from, to) {
+        if (failRenameOnce && to === path) {
+          failRenameOnce = false;
+          throw fsError('EBUSY');
+        }
+        return renameSync(from, to);
+      },
+    },
+  });
+  third.handleToolEventForThread('thread', command('same', { toolCallId: 'call:delayed-add' }));
+  // Another tracker saves a fresh replacement at the same millisecond before third's retry runs.
+  const fourth = tracker(t, { persistPath: path });
+  fourth.handleToolEventForThread('thread', command('same', { toolCallId: 'call:saved-replacement' }));
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks[0].parentToolCallId, 'call:saved-replacement');
+
+  // When third's scheduled retry flushes its delayed add, it must preserve the already-saved replacement.
+  t.mock.timers.tick(10);
+  assert.deepEqual(
+    JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => [task.taskId, task.parentToolCallId]),
+    [['same', 'call:saved-replacement']],
+  );
+});
+
+test('Windows transient marker I/O uses bounded exponential backoff for lock acquisition and marker cleanup', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(Math, 'random', () => 0);
+  const path = statePath(t);
+  const lockDir = `${path}.locks`;
+
+  // 1. withTaskStateLock classifies Windows transient marker I/O as 'transient' and cleans up created markers.
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    assert.deepEqual(
+      withTaskStateLock(path, () => 'never', { mkdirSync() { throw fsError(code); } }),
+      { status: 'transient' },
+    );
+    assert.deepEqual(
+      withTaskStateLock(path, () => 'never', { openSync() { throw fsError(code); } }),
+      { status: 'transient' },
+    );
+    assert.deepEqual(
+      withTaskStateLock(path, () => 'never', {
+        closeSync(fd) {
+          closeSync(fd);
+          throw fsError(code);
+        },
+      }),
+      { status: 'transient' },
+    );
+    assert.deepEqual(readdirSync(lockDir), []);
+    assert.deepEqual(
+      withTaskStateLock(path, () => 'never', { readdirSync() { throw fsError(code); } }),
+      { status: 'transient' },
+    );
+    assert.deepEqual(readdirSync(lockDir), []);
+  }
+  assert.deepEqual(
+    withTaskStateLock(path, () => 'never', { mkdirSync() { throw fsError('EIO'); } }),
+    { status: 'error' },
+  );
+
+  // 2. Marker unlink retries transiently with exponential backoff, succeeds when cleared, and bounds permanent errors.
+  let unlinkFailures = 3;
+  let unlinkAttempts = 0;
+  assert.deepEqual(
+    withTaskStateLock(path, () => 'ok', {
+      unlinkSync(target) {
+        unlinkAttempts += 1;
+        if (unlinkFailures > 0) {
+          unlinkFailures -= 1;
+          throw fsError('EPERM');
+        }
+        return unlinkSync(target);
+      },
+    }),
+    { status: 'acquired', value: 'ok' },
+  );
+  assert.equal(unlinkAttempts, 1);
+  assert.equal(readdirSync(lockDir).length, 1);
+  t.mock.timers.tick(9);
+  assert.equal(unlinkAttempts, 1);
+  t.mock.timers.tick(1); // 10ms
+  assert.equal(unlinkAttempts, 2);
+  t.mock.timers.tick(19);
+  assert.equal(unlinkAttempts, 2);
+  t.mock.timers.tick(1); // 20ms
+  assert.equal(unlinkAttempts, 3);
+  t.mock.timers.tick(40); // 40ms
+  assert.equal(unlinkAttempts, 4);
+  assert.deepEqual(readdirSync(lockDir), []);
+
+  let permanentUnlinkAttempts = 0;
+  let permanentMarker = '';
+  assert.deepEqual(
+    withTaskStateLock(path, () => 'ok', {
+      unlinkSync(target) {
+        permanentMarker = String(target);
+        permanentUnlinkAttempts += 1;
+        throw fsError('EACCES');
+      },
+    }),
+    { status: 'acquired', value: 'ok' },
+  );
+  drainTimers(t);
+  assert.equal(permanentUnlinkAttempts, 21, 'marker unlink retries must be bounded at TRANSIENT_IO_MAX_RETRIES');
+  unlinkSync(permanentMarker);
+
+  // 3. Tracker persistence retries on Windows transient marker EPERM/EACCES and bounds permanent failures.
+  let markerFailures = ['EPERM', 'EACCES', 'EBUSY'];
+  let openAttempts = 0;
+  const recovering = tracker(t, {
+    persistPath: path,
+    taskStateFs: {
+      openSync(target, flags) {
+        if (String(target).endsWith('.lock')) {
+          openAttempts += 1;
+          const code = markerFailures.shift();
+          if (code) throw fsError(code);
+        }
+        return openSync(target, flags);
+      },
+    },
+  });
+  openAttempts = 0;
+  markerFailures = ['EPERM', 'EACCES', 'EBUSY'];
+  recovering.handleToolEventForThread('win', command('marker-retry'));
+  assert.equal(openAttempts, 1);
+  assert.equal(existsSync(path), false);
+  t.mock.timers.tick(10); // attempt 2 (EACCES)
+  t.mock.timers.tick(20); // attempt 3 (EBUSY)
+  t.mock.timers.tick(40); // attempt 4 (succeeds)
+  assert.equal(openAttempts, 4);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId), ['marker-retry']);
+
+  const boundedPath = statePath(t);
+  let boundedOpenAttempts = 0;
+  const bounded = tracker(t, {
+    persistPath: boundedPath,
+    taskStateFs: {
+      openSync(target, flags) {
+        if (String(target).endsWith('.lock')) {
+          boundedOpenAttempts += 1;
+          throw fsError('EPERM');
+        }
+        return openSync(target, flags);
+      },
+    },
+  });
+  boundedOpenAttempts = 0;
+  bounded.handleToolEventForThread('win', command('permanent-eperm'));
+  drainTimers(t);
+  assert.equal(boundedOpenAttempts, 21, 'transient marker retries must stop after TRANSIENT_IO_MAX_RETRIES');
+  assert.equal(existsSync(boundedPath), false);
+});
+
+test('dispose guards persisted state against late calls and cancels pending persistence timers', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(Math, 'random', () => 0);
+  const path = statePath(t);
+
+  // Case A: active tracker disposed preserves persisted records even if late calls arrive.
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('thread', command('survives'));
+  first.dispose();
+  assert.deepEqual(first.clearThread('thread', true), []);
+  assert.deepEqual(first.handleInboundRequest({ method: 'thread/stop', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(first.handleInboundRequest({ method: 'thread/discard', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(first.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(first.handleInboundRequest({ method: 'turn/start', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(first.handleToolEventForThread('thread', command('after-dispose')), []);
+  assert.deepEqual(first.inspectTextForCompletions('thread', 'Task id "survives" failed'), []);
+  const orphanLine = JSON.stringify({
+    method: 'thread/delta',
+    params: { threadId: 'thread', deltas: [{ kind: 'item.close', status: 'completed', key: { providerItemId: 'call:orphan' } }] },
+  });
+  assert.deepEqual(first.processStdoutLine(orphanLine), [orphanLine]);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId), ['survives']);
+
+  // Case B: restarted tracker disposed before resume leaves persisted records intact for the next host.
+  const restarted = tracker(t, { persistPath: path });
+  restarted.dispose();
+  assert.deepEqual(restarted.clearThread('thread'), []);
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/stop', params: { threadId: 'thread' } }), []);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId), ['survives']);
+
+  // Case C: pending retry timers (write + deferred reconciliation) are cancelled on dispose and never fire.
+  let blockRead = true;
+  let readsAfterDispose = 0;
+  let disposedFlag = false;
+  const asyncEvents = [];
+  const pendingTracker = tracker(t, {
+    persistPath: path,
+    onAsyncDeltas: (threadId, deltas) => asyncEvents.push({ threadId, deltas }),
+    taskStateFs: {
+      readFileSync(filePath, options) {
+        if (disposedFlag) readsAfterDispose += 1;
+        if (blockRead && filePath === path) throw fsError('EBUSY');
+        return readFileSync(filePath, options);
+      },
+    },
+  });
+  assert.deepEqual(pendingTracker.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+  pendingTracker.handleToolEventForThread('other', command('queued-add'));
+  pendingTracker.dispose();
+  disposedFlag = true;
+  blockRead = false;
+  drainTimers(t);
+  assert.equal(readsAfterDispose, 0);
+  assert.equal(asyncEvents.length, 0);
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId), ['survives']);
+
+  // A subsequent healthy host still reconciles the preserved record cleanly.
+  const nextHost = tracker(t, { persistPath: path });
+  assert.deepEqual(
+    nextHost.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }).map(d => d.key.providerItemId),
+    ['task:survives'],
+  );
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks, []);
 });
 
 // Silent turn detection: a turn that ends with a failed command with empty output and no
