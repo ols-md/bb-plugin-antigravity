@@ -781,9 +781,11 @@ test('getResource after deletion and re-add does not join invalidated in-flight 
   const getResource = handlers['provider-usage.v1.getResource'];
   const host1Id = JSON.stringify(['host_1', 'antigravity-cli']);
 
-  const firstGet = getResource({ resourceId: host1Id, refresh: true });
+  const firstGet = getResource({ resourceId: JSON.stringify(JSON.parse(host1Id), null, 2), refresh: true });
   await slowGetStarted;
 
+  // Rediscovery of the same provider must leave its pending quota read cancellable.
+  await listResources({});
   enabled = false;
   await listResources({});
   enabled = true;

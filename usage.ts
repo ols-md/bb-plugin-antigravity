@@ -356,6 +356,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     hostId: string;
     seq: number;
     refresh: boolean;
+    collectingQuota: boolean;
     invalidated: boolean;
     superseded: boolean;
     promise: Promise<CachedObservation>;
@@ -364,7 +365,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     seq: number;
     invalidatedResources: Set<string>;
     protectedResources: Set<string>;
-    newerHostSnapshots: Array<Set<string>>;
+    hostsInEveryNewerSnapshot?: Set<string>;
   };
 
   const expectedPluginId = bb.pluginId ?? PLUGIN_ID;
@@ -388,7 +389,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
   const supersedeInflight = (resourceId: string, sourceSeq: number) => {
     const entry = inflight.get(resourceId);
-    if (!entry || entry.seq >= sourceSeq) return;
+    if (!entry || entry.seq >= sourceSeq || entry.collectingQuota) return;
     entry.superseded = true;
     inflight.delete(resourceId);
   };
@@ -505,9 +506,10 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       if (!entry.superseded) evictResource(resourceId, entry.seq);
       throw new Error("Usage resource no longer exists.");
     }
-    if (!entry.superseded) {
-      confirmResource(toUsageResource(host, matchedProvider.displayName), entry.seq);
-    }
+    // A newer discovery replaced this lookup. Recheck before collecting quota.
+    if (entry.superseded) return collectResource(resourceId, refresh);
+    confirmResource(toUsageResource(host, matchedProvider.displayName), entry.seq);
+    entry.collectingQuota = true;
 
     const currentCached = cache.get(resourceId);
     if (
@@ -578,6 +580,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       hostId,
       seq: ++requestSeq,
       refresh,
+      collectingQuota: false,
       invalidated: false,
       superseded: false,
       promise: undefined as unknown as Promise<CachedObservation>,
@@ -600,7 +603,6 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
           seq: snapshotSeq,
           invalidatedResources: new Set(),
           protectedResources: new Set(),
-          newerHostSnapshots: [],
         };
         activeLists.add(listToken);
         try {
@@ -609,7 +611,12 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
           for (const activeList of activeLists) {
             if (activeList.seq < snapshotSeq) {
-              activeList.newerHostSnapshots.push(liveHostIds);
+              const common = activeList.hostsInEveryNewerSnapshot;
+              if (common) {
+                for (const id of common) if (!liveHostIds.has(id)) common.delete(id);
+              } else {
+                activeList.hostsInEveryNewerSnapshot = new Set(liveHostIds);
+              }
             }
           }
           for (const entry of inflight.values()) {
@@ -632,7 +639,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
           for (const host of hosts) {
             const expectedId = toResourceId(host.id);
-            const absentInNewerSnapshot = listToken.newerHostSnapshots.some(ids => !ids.has(host.id));
+            const absentInNewerSnapshot = listToken.hostsInEveryNewerSnapshot?.has(host.id) === false;
             if (host.status === "disconnected") {
               if (!absentInNewerSnapshot && knownResources.has(expectedId)) {
                 resources.push(toUsageResource(host));
@@ -682,7 +689,10 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
           activeLists.delete(listToken);
         }
       },
-      [GET_RESOURCE_METHOD]: ({ resourceId, refresh }) => collectResource(resourceId, refresh),
+      async [GET_RESOURCE_METHOD]({ resourceId, refresh }) {
+        const tuple = resourceIdTupleSchema.parse(JSON.parse(resourceId));
+        return collectResource(JSON.stringify(tuple), refresh);
+      },
     },
     {
       experimental_discoverable: true,
