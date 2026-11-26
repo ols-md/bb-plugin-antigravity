@@ -4,6 +4,15 @@
   "type": "module",
   "license": "MIT",
   "description": "Use the installed Antigravity CLI as an ACP agent in BB.",
+  "keywords": [
+    "bb-plugin",
+    "antigravity",
+    "acp",
+    "cli",
+    "gemini",
+    "claude",
+    "planning"
+  ],
   "files": [
     "server.ts",
     "host.ts",
@@ -33,7 +42,7 @@
   },
   "bb": {
     "name": "Antigravity CLI [Experimental]",
-    "description": "Chat with Antigravity in BB using your installed CLI and existing sign-in.",
+    "description": "Plan and code with Google Antigravity inside BB. Choose your model and reasoning level, and review tool requests in your thread. Check quota and reset times in BB. You need the standalone Antigravity CLI and an eligible account. Antigravity quota or charges apply. Tested on Windows.",
     "branding": {
       "icon": "./assets/icon.svg"
     },
@@ -41,6 +50,12 @@
     "host": "./host.ts",
     "skills": [
       "skills"
+    ]
+  },
+  "bbMarketplace": {
+    "category": "agents-and-providers",
+    "screenshots": [
+      "./assets/screenshots/marketplace-overview.png"
     ]
   },
   "scripts": {
