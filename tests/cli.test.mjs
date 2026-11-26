@@ -11,7 +11,29 @@ test('Windows installer location works without agy on PATH for launch and usage'
   const env = { ...process.env, PATH: root, USERPROFILE: root, LOCALAPPDATA: root };
   const command = join(root, 'agy', 'bin', 'agy.exe');
   try {
-    assert.equal(resolveAntigravityCommand('agy', { env }), null);
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    writeFileSync(join(workspace, 'agy.exe'), 'workspace executable');
+    assert.equal(resolveAntigravityCommand('agy', { cwd: workspace, env }), null);
+    const missingUsage = await readAntigravityProviderUsage({
+      cwd: workspace,
+      env,
+      execFile: async () => assert.fail('usage must not execute the workspace CLI'),
+    });
+    assert.equal(missingUsage.usage.status, 'not_installed');
+
+    const missingSpec = { command: 'agy', args: ['acp'], cwd: workspace, env };
+    resolveAntigravityLaunchSpec({
+      params: {
+        cwd: workspace,
+        options: {
+          providerOptions: { acpLaunchSpec: missingSpec },
+          envVars: { PATH: workspace, LOCALAPPDATA: workspace },
+        },
+      },
+    });
+    assert.equal(missingSpec.command, command);
+
     mkdirSync(join(root, 'agy', 'bin'), { recursive: true });
     writeFileSync(command, 'fixture');
     assert.equal(resolveAntigravityCommand('agy', { env }), command);
@@ -30,6 +52,26 @@ test('Windows installer location works without agy on PATH for launch and usage'
       return { stdout: '{}', stderr: '' };
     } });
     assert.equal(executed, command);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('launch searches the quoted Windows host PATH and ignores session PATH', { skip: process.platform !== 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'agy-host-path-'));
+  const hostBin = join(root, 'host bin');
+  const workspace = join(root, 'workspace');
+  const command = join(hostBin, 'agy.exe');
+  try {
+    mkdirSync(hostBin);
+    mkdirSync(workspace);
+    writeFileSync(command, 'host executable');
+    writeFileSync(join(workspace, 'agy.exe'), 'workspace executable');
+    const spec = { command: 'agy', args: ['acp'], cwd: workspace, env: { Path: `"${hostBin}"` } };
+    resolveAntigravityLaunchSpec({
+      params: { options: { providerOptions: { acpLaunchSpec: spec }, envVars: { PATH: workspace } } },
+    });
+    assert.equal(spec.command, command);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
