@@ -93,6 +93,12 @@ const RETAINED_INPUT_STRING_KEYS = [
 ] as const;
 const TERMINAL_TOOL_STATUS = /^(?:completed|failed|cancell?ed)$/;
 const COMPLETION_HINT = /Task id|Subagent/i;
+const TASK_ANNOUNCEMENT_RE = /Task id "([^"]+)" (finished with result:|was canceled|was killed|terminated|failed)/gi;
+const SUBAGENT_IDLE_RE = /Subagent ([^\s"]+) has gone idle/gi;
+const RESULT_FAILED_RE = /Command exited with code ([1-9]\d*)|Encountered error/i;
+const RESULT_KILLED_RE = /Step was canceled/i;
+const FLAG_TAIL_CHARS = 64;
+const TRUNCATION_MARKER = '\n...[truncated]...\n';
 // After this many consecutive silent turns (failed empty-output command, no agent text),
 // the injected message escalates to "command execution appears broken in this session".
 export const SILENT_TURN_ESCALATION_THRESHOLD = 2;
@@ -123,22 +129,48 @@ function containsTaskToken(text: string, token: string): boolean {
   return new RegExp(`(?<![A-Za-z0-9_/-])${escaped}(?![A-Za-z0-9_/-])`).test(text);
 }
 
+function sliceHeadSafe(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  let end = maxLen;
+  if (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+function sliceTailSafe(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  let start = text.length - maxLen;
+  if (start < text.length && text.charCodeAt(start) >= 0xdc00 && text.charCodeAt(start) <= 0xdfff) start += 1;
+  return text.slice(start);
+}
+
 function boundText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
-  const marker = '\n...[truncated]...\n';
-  if (maxChars <= marker.length + 2) return text.slice(0, maxChars);
-  const budget = maxChars - marker.length;
-  let head = Math.ceil(budget / 2);
-  let tailStart = text.length - (budget - head);
-  if (head > 0 && text.charCodeAt(head - 1) >= 0xd800 && text.charCodeAt(head - 1) <= 0xdbff) head -= 1;
-  if (tailStart < text.length && text.charCodeAt(tailStart) >= 0xdc00 && text.charCodeAt(tailStart) <= 0xdfff) tailStart += 1;
-  return `${text.slice(0, head)}${marker}${text.slice(tailStart)}`;
+  if (maxChars <= TRUNCATION_MARKER.length + 2) return sliceHeadSafe(text, maxChars);
+  const budget = maxChars - TRUNCATION_MARKER.length;
+  const head = Math.ceil(budget / 2);
+  const tail = budget - head;
+  return `${sliceHeadSafe(text, head)}${TRUNCATION_MARKER}${sliceTailSafe(text, tail)}`;
 }
 
 function unescapeOversizedText(raw: string): string {
   return raw
     .replace(/\\(["nrt\\])/g, (_, ch: string) => ch === 'n' ? '\n' : ch === 'r' ? '\r' : ch === 't' ? '\t' : ch)
     .replace(/\\"/g, '"');
+}
+
+function unescapeIncremental(carry: string, raw: string, flush: boolean): { text: string; carry: string } {
+  const input = carry ? carry + raw : raw;
+  if (!input) return { text: '', carry: '' };
+  if (flush) return { text: unescapeOversizedText(input), carry: '' };
+  let trailing = 0;
+  for (let i = input.length - 1; i >= 0 && input.charCodeAt(i) === 0x5c /* '\' */; i -= 1) trailing += 1;
+  if (trailing === 0) return { text: unescapeOversizedText(input), carry: '' };
+  const hold = trailing <= 3 ? trailing : trailing % 2;
+  if (hold === 0) return { text: unescapeOversizedText(input), carry: '' };
+  return {
+    text: unescapeOversizedText(input.slice(0, input.length - hold)),
+    carry: input.slice(input.length - hold),
+  };
 }
 
 function compactRawInput(rawInput: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -389,12 +421,33 @@ export function createBackgroundTaskTracker(options: {
   /** Maximum characters buffered per thread for streamed text completion scanning (default 64 KiB). */
   maxStreamBufferChars?: number;
 } = {}) {
+  interface PendingAnnouncement {
+    taskId: string;
+    failed: boolean;
+    killed: boolean;
+    summaryHead: string;
+    summaryTail: string;
+    truncated: boolean;
+    flagTail: string;
+  }
+  interface StreamingScanState {
+    buffer: string;
+    pending?: PendingAnnouncement;
+  }
+  interface TranscriptWatcherState {
+    offset: number;
+    partial: string;
+    oversizedLine: boolean;
+    oversizedBackslash: string;
+    oversizedScan?: StreamingScanState;
+    decoder: StringDecoder;
+  }
   const threads = new Map<string, Map<string, BackgroundTask>>();
   const pending = new Map<string, RetainedToolEvent[]>();
   let pendingCount = 0;
   const threadTools = new Map<string, Map<string, RetainedToolEvent>>();
-  const streamBuffers = new Map<string, string>();
-  const watchers = new Map<string, Map<string, { offset: number; partial: string; oversizedLine: boolean; decoder: StringDecoder }>>();
+  const streamBuffers = new Map<string, StreamingScanState>();
+  const watchers = new Map<string, Map<string, TranscriptWatcherState>>();
   let timer: ReturnType<typeof setInterval> | undefined;
   let catchUpTimer: ReturnType<typeof setImmediate> | undefined;
   let readBuffer: Buffer | undefined;
@@ -641,40 +694,144 @@ export function createBackgroundTaskTracker(options: {
     if (!threads.get(thread)?.size) return [];
     const results: BackgroundTaskDelta[] = [];
     // Bound each result at the next announcement so failures cannot spill into another task.
-    const announcements = [...text.matchAll(/Task id "([^"]+)" (finished with result:|was canceled|was killed|terminated|failed)/gi)];
+    const announcements = [...text.matchAll(TASK_ANNOUNCEMENT_RE)];
     announcements.forEach((match, i) => {
       if (match.index! >= maxMatchIndex) return;
       const result = text.slice(match.index! + match[0].length, announcements[i + 1]?.index ?? text.length);
-      const failed = match[2].toLowerCase() === 'failed' || /Command exited with code ([1-9]\d*)|Encountered error/i.test(result);
-      const killed = /was canceled|was killed|terminated/i.test(match[2]) || /Step was canceled/i.test(result);
+      const failed = match[2].toLowerCase() === 'failed' || RESULT_FAILED_RE.test(result);
+      const killed = /was canceled|was killed|terminated/i.test(match[2]) || RESULT_KILLED_RE.test(result);
       results.push(...settle(thread, match[1], failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', result.trim(), 'local_bash'));
     });
-    for (const match of text.matchAll(/Subagent ([^\s"]+) has gone idle/gi)) {
+    for (const match of text.matchAll(SUBAGENT_IDLE_RE)) {
       if (match.index! >= maxMatchIndex) break;
       results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
     }
     return results;
   }
-  function inspectOversizedSegment(thread: string, segment: string, rawCut: number): BackgroundTaskDelta[] {
-    if (rawCut <= 0 || !COMPLETION_HINT.test(segment)) return [];
-    const prefix = unescapeOversizedText(segment.slice(0, rawCut));
-    const lookahead = rawCut < segment.length ? unescapeOversizedText(segment.slice(rawCut)) : '';
-    return inspectTextForCompletions(thread, lookahead ? `${prefix}${lookahead}` : prefix, prefix.length);
+  function appendPendingResult(pendingAnnouncement: PendingAnnouncement, fragment: string) {
+    if (!fragment) return;
+    const flagWindow = pendingAnnouncement.flagTail ? pendingAnnouncement.flagTail + fragment : fragment;
+    if (!pendingAnnouncement.failed && RESULT_FAILED_RE.test(flagWindow)) pendingAnnouncement.failed = true;
+    if (!pendingAnnouncement.killed && RESULT_KILLED_RE.test(flagWindow)) pendingAnnouncement.killed = true;
+    pendingAnnouncement.flagTail = flagWindow.slice(-FLAG_TAIL_CHARS);
+
+    const budget = Math.max(0, maxToolOutputChars - TRUNCATION_MARKER.length);
+    const headLen = Math.ceil(budget / 2);
+    const tailLen = budget - headLen;
+    const rollingTailCap = tailLen + 256;
+
+    if (!pendingAnnouncement.truncated) {
+      const piece = pendingAnnouncement.summaryHead ? fragment : fragment.trimStart();
+      if (!piece) return;
+      if (pendingAnnouncement.summaryHead.length + piece.length <= maxToolOutputChars) {
+        pendingAnnouncement.summaryHead += piece;
+      } else {
+        const full = pendingAnnouncement.summaryHead + piece;
+        pendingAnnouncement.truncated = true;
+        pendingAnnouncement.summaryHead = sliceHeadSafe(full, headLen);
+        pendingAnnouncement.summaryTail = sliceTailSafe(full, rollingTailCap);
+      }
+    } else {
+      const combinedTail = pendingAnnouncement.summaryTail ? pendingAnnouncement.summaryTail + fragment : fragment;
+      pendingAnnouncement.summaryTail = sliceTailSafe(combinedTail, rollingTailCap);
+    }
+  }
+  function finalizePendingAnnouncement(thread: string, pendingAnnouncement: PendingAnnouncement): BackgroundTaskDelta[] {
+    let summary: string;
+    if (!pendingAnnouncement.truncated) {
+      summary = pendingAnnouncement.summaryHead.trim();
+    } else if (maxToolOutputChars <= TRUNCATION_MARKER.length + 2) {
+      summary = pendingAnnouncement.summaryHead.trim().slice(0, maxToolOutputChars);
+    } else {
+      const budget = maxToolOutputChars - TRUNCATION_MARKER.length;
+      const headLen = Math.ceil(budget / 2);
+      const tailLen = budget - headLen;
+      const head = sliceHeadSafe(pendingAnnouncement.summaryHead, headLen);
+      const tail = sliceTailSafe(pendingAnnouncement.summaryTail.trimEnd(), tailLen);
+      summary = `${head}${TRUNCATION_MARKER}${tail}`.trim();
+    }
+    const status = pendingAnnouncement.failed ? 'failed' : pendingAnnouncement.killed ? 'interrupted' : 'completed';
+    const taskStatus = pendingAnnouncement.failed ? 'failed' : pendingAnnouncement.killed ? 'killed' : 'completed';
+    return settle(thread, pendingAnnouncement.taskId, status, taskStatus, summary, 'local_bash');
   }
   function safeSliceCut(text: string, overlap: number): number {
     let cut = text.length - overlap;
-    if (cut > 0) {
-      let backslashes = 0;
-      for (let i = cut - 1; i >= 0 && text.charCodeAt(i) === 0x5c /* '\' */; i -= 1) backslashes += 1;
-      if (backslashes % 2 === 1) cut -= 1;
-    }
     if (cut > 0 && text.charCodeAt(cut - 1) >= 0xd800 && text.charCodeAt(cut - 1) <= 0xdbff) cut -= 1;
     return cut;
+  }
+  function feedStreamingCompletions(
+    thread: string,
+    scan: StreamingScanState,
+    incoming: string,
+    final: boolean,
+    maxChars: number,
+    overlap: number,
+  ): BackgroundTaskDelta[] {
+    const text = scan.buffer ? scan.buffer + incoming : incoming;
+    if (!final && text.length <= maxChars) {
+      scan.buffer = text;
+      return [];
+    }
+    if (!threads.get(thread)?.size) {
+      scan.buffer = '';
+      scan.pending = undefined;
+      return [];
+    }
+    const results: BackgroundTaskDelta[] = [];
+    const limit = final ? text.length : safeSliceCut(text, overlap);
+    let cursor = 0;
+
+    if (COMPLETION_HINT.test(text)) {
+      for (const match of text.matchAll(TASK_ANNOUNCEMENT_RE)) {
+        const index = match.index!;
+        if (index >= limit) break;
+        if (scan.pending) {
+          if (index > cursor) appendPendingResult(scan.pending, text.slice(cursor, index));
+          results.push(...finalizePendingAnnouncement(thread, scan.pending));
+          scan.pending = undefined;
+        }
+        scan.pending = {
+          taskId: match[1],
+          failed: match[2].toLowerCase() === 'failed',
+          killed: /was canceled|was killed|terminated/i.test(match[2]),
+          summaryHead: '',
+          summaryTail: '',
+          truncated: false,
+          flagTail: '',
+        };
+        cursor = index + match[0].length;
+      }
+      for (const match of text.matchAll(SUBAGENT_IDLE_RE)) {
+        if (match.index! >= limit) break;
+        results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+      }
+    }
+
+    if (final) {
+      if (scan.pending) {
+        if (cursor < text.length) appendPendingResult(scan.pending, text.slice(cursor));
+        results.push(...finalizePendingAnnouncement(thread, scan.pending));
+        scan.pending = undefined;
+      }
+      scan.buffer = '';
+    } else {
+      const keepFrom = Math.max(limit, cursor);
+      if (scan.pending && cursor < limit) {
+        appendPendingResult(scan.pending, text.slice(cursor, limit));
+      }
+      if (threads.get(thread)?.size) {
+        scan.buffer = text.slice(keepFrom);
+      } else {
+        scan.buffer = '';
+        scan.pending = undefined;
+      }
+    }
+    return results;
   }
   function consumeTranscriptChunk(
     thread: string,
     path: string,
-    state: { offset: number; partial: string; oversizedLine: boolean; decoder: StringDecoder },
+    state: TranscriptWatcherState,
     chunk: string,
   ): BackgroundTaskDelta[] {
     const deltas: BackgroundTaskDelta[] = [];
@@ -691,16 +848,27 @@ export function createBackgroundTaskTracker(options: {
       const nl = chunk.indexOf('\n', pos);
       if (nl === -1) {
         const rest = chunk.slice(pos);
-        const combined = state.partial ? state.partial + rest : rest;
-        if (combined.length > maxLineChars) {
+        if (state.oversizedLine) {
           flushPlain();
           if (disposed || watchers.get(thread)?.get(path) !== state) break;
-          state.oversizedLine = true;
-          const cut = safeSliceCut(combined, lineOverlap);
-          deltas.push(...inspectOversizedSegment(thread, combined, cut));
-          state.partial = combined.slice(cut);
+          const decoded = unescapeIncremental(state.oversizedBackslash, rest, false);
+          state.oversizedBackslash = decoded.carry;
+          state.oversizedScan ??= { buffer: '' };
+          deltas.push(...feedStreamingCompletions(thread, state.oversizedScan, decoded.text, false, maxLineChars, lineOverlap));
         } else {
-          state.partial = combined;
+          const combined = state.partial ? state.partial + rest : rest;
+          if (combined.length > maxLineChars) {
+            flushPlain();
+            if (disposed || watchers.get(thread)?.get(path) !== state) break;
+            state.oversizedLine = true;
+            state.partial = '';
+            const decoded = unescapeIncremental('', combined, false);
+            state.oversizedBackslash = decoded.carry;
+            state.oversizedScan = { buffer: '' };
+            deltas.push(...feedStreamingCompletions(thread, state.oversizedScan, decoded.text, false, maxLineChars, lineOverlap));
+          } else {
+            state.partial = combined;
+          }
         }
         break;
       }
@@ -709,10 +877,13 @@ export function createBackgroundTaskTracker(options: {
       if (state.oversizedLine) {
         flushPlain();
         if (disposed || watchers.get(thread)?.get(path) !== state) break;
-        const tail = state.partial ? state.partial + piece : piece;
+        const decoded = unescapeIncremental(state.oversizedBackslash, piece, true);
+        const scan = state.oversizedScan ?? { buffer: '' };
         state.partial = '';
         state.oversizedLine = false;
-        if (tail) deltas.push(...inspectOversizedSegment(thread, tail, tail.length));
+        state.oversizedBackslash = '';
+        state.oversizedScan = undefined;
+        deltas.push(...feedStreamingCompletions(thread, scan, decoded.text, true, maxLineChars, lineOverlap));
       } else {
         const line = state.partial ? state.partial + piece : piece;
         state.partial = '';
@@ -720,7 +891,9 @@ export function createBackgroundTaskTracker(options: {
         if (line.length > maxLineChars) {
           flushPlain();
           if (disposed || watchers.get(thread)?.get(path) !== state) break;
-          deltas.push(...inspectOversizedSegment(thread, line, line.length));
+          if (COMPLETION_HINT.test(line)) {
+            deltas.push(...inspectTextForCompletions(thread, unescapeOversizedText(line)));
+          }
         } else if (plainLines.length > 0 || COMPLETION_HINT.test(line)) {
           // Transcript records encode message text as JSON strings.
           let parsed: unknown;
@@ -760,7 +933,14 @@ export function createBackgroundTaskTracker(options: {
       try {
         fd = openSync(path, 'r');
         const size = fstatSync(fd).size;
-        if (size < state.offset) { state.offset = 0; state.partial = ''; state.oversizedLine = false; state.decoder = new StringDecoder('utf8'); }
+        if (size < state.offset) {
+          state.offset = 0;
+          state.partial = '';
+          state.oversizedLine = false;
+          state.oversizedBackslash = '';
+          state.oversizedScan = undefined;
+          state.decoder = new StringDecoder('utf8');
+        }
         if (size > state.offset) {
           const toRead = Math.min(size - state.offset, maxReadBytes);
           readBuffer ??= Buffer.allocUnsafe(maxReadBytes);
@@ -850,7 +1030,7 @@ export function createBackgroundTaskTracker(options: {
       if (!paths.has(task.transcriptPath)) {
         let offset = 0;
         try { offset = statSync(task.transcriptPath).size; } catch { /* Start at zero when the file appears. */ }
-        paths.set(task.transcriptPath, { offset, partial: '', oversizedLine: false, decoder: new StringDecoder('utf8') });
+        paths.set(task.transcriptPath, { offset, partial: '', oversizedLine: false, oversizedBackslash: '', decoder: new StringDecoder('utf8') });
       }
       watchers.set(thread, paths);
       if (!timer) { timer = setInterval(poll, interval); timer.unref(); }
@@ -1204,19 +1384,10 @@ export function createBackgroundTaskTracker(options: {
         if (entry?.kind === 'turn.open' && !routeTurnOpen(params.threadId)) { modified = true; continue; }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
           if (threads.get(params.threadId)?.size) {
-            const existing = streamBuffers.get(params.threadId);
-            const combined = existing ? existing + entry.text : entry.text;
-            if (combined.length > maxStreamChars) {
-              const cut = safeSliceCut(combined, streamOverlap);
-              extra.push(...inspectTextForCompletions(params.threadId, combined, cut));
-              if (threads.get(params.threadId)?.size) {
-                streamBuffers.set(params.threadId, combined.slice(cut));
-              } else {
-                streamBuffers.delete(params.threadId);
-              }
-            } else {
-              streamBuffers.set(params.threadId, combined);
-            }
+            let scan = streamBuffers.get(params.threadId);
+            if (!scan) { scan = { buffer: '' }; streamBuffers.set(params.threadId, scan); }
+            extra.push(...feedStreamingCompletions(params.threadId, scan, entry.text, false, maxStreamChars, streamOverlap));
+            if (!threads.get(params.threadId)?.size) streamBuffers.delete(params.threadId);
           } else {
             streamBuffers.delete(params.threadId);
           }
@@ -1228,9 +1399,9 @@ export function createBackgroundTaskTracker(options: {
           extra.push(...inspectTextForCompletions(params.threadId, entry.text));
         }
         if (entry?.kind === 'item.textClose' || entry?.kind === 'turn.boundary') {
-          const buffered = streamBuffers.get(params.threadId);
+          const scan = streamBuffers.get(params.threadId);
           streamBuffers.delete(params.threadId);
-          if (buffered) extra.push(...inspectTextForCompletions(params.threadId, buffered));
+          if (scan) extra.push(...feedStreamingCompletions(params.threadId, scan, '', true, maxStreamChars, streamOverlap));
         }
         if (entry?.kind === 'item.textClose' && typeof entry.text === 'string' && entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
           silentState(params.threadId).agentText = true;

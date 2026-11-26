@@ -260,6 +260,117 @@ test('long tool-heavy sessions bound retained tool output while preserving PR 31
   assert.ok(tr.async.flatMap(entry => entry.deltas).some(d => d.kind === 'turn.boundary'));
 });
 
+test('giant JSONL record delays settlement until record close or next announcement when exit/cancel status is beyond overlap', async t => {
+  const { transcript, logFor } = createTranscriptFixture(t, 'bg-giant-late-exit-');
+  const tr = tracker(t, {
+    pollIntervalMs: 10,
+    maxTranscriptReadBytes: 1024,
+    maxTranscriptLineChars: 2048,
+    maxRetainedToolOutputChars: 512,
+  });
+  tr.handleToolEventForThread('t', command('conv/giant-ok', logFor('giant-ok')));
+  tr.handleToolEventForThread('t', command('conv/giant-fail', logFor('giant-fail')));
+  tr.handleToolEventForThread('t', command('conv/giant-cancel', logFor('giant-cancel')));
+
+  // One giant JSONL line containing three announcements whose results are each >> maxTranscriptLineChars (2048):
+  // - giant-ok succeeds (must not be poisoned by giant-fail's exit code)
+  // - giant-fail has its nonzero exit code 24 KiB after the announcement (well past the 1024-char overlap)
+  // - giant-cancel has "Step was canceled" 20 KiB after the announcement
+  const content = [
+    `Task id "conv/giant-ok" finished with result: OK_HEAD ${'a'.repeat(18_000)} OK_TAIL`,
+    `Task id "conv/giant-fail" finished with result: FAIL_HEAD ${'b'.repeat(24_000)} Command exited with code 17 FAIL_TAIL`,
+    `Task id "conv/giant-cancel" finished with result: CANCEL_HEAD ${'c'.repeat(20_000)} Step was canceled CANCEL_TAIL`,
+  ].join('\n');
+  const giantLine = JSON.stringify({ content });
+
+  // Append the first half (without newline) and verify giant-fail is NOT prematurely settled as completed.
+  const splitAt = giantLine.indexOf('Command exited with code 17') - 2000;
+  assert.ok(splitAt > 20_000);
+  appendFileSync(transcript, giantLine.slice(0, splitAt));
+
+  // giant-ok can settle once giant-fail's announcement bounds it, while giant-fail must wait for the rest of its result.
+  await until(() => tr.async.flatMap(e => e.deltas).some(d => d.kind === 'item.close' && d.item.familyId === 'conv/giant-ok'));
+  await sleep(40);
+  assert.equal(tr.getActiveTasks('t').some(task => task.taskId === 'conv/giant-fail'), true, 'giant-fail must not settle prematurely as completed');
+
+  // Now append the rest of the giant record (with the nonzero exit code, cancel notice, and terminating newline).
+  appendFileSync(transcript, `${giantLine.slice(splitAt)}\n`);
+
+  await until(() => tr.getActiveTasks('t').length === 0);
+  const closes = tr.async.flatMap(entry => entry.deltas).filter(d => d.kind === 'item.close');
+  const byId = new Map(closes.map(d => [d.item.familyId, d]));
+
+  assert.equal(byId.get('conv/giant-ok')?.status, 'completed');
+  assert.ok((byId.get('conv/giant-ok')?.item.summary?.length ?? 0) <= 512);
+  assert.match(byId.get('conv/giant-ok')?.item.summary ?? '', /OK_HEAD/);
+  assert.match(byId.get('conv/giant-ok')?.item.summary ?? '', /OK_TAIL/);
+
+  assert.equal(byId.get('conv/giant-fail')?.status, 'failed');
+  assert.ok((byId.get('conv/giant-fail')?.item.summary?.length ?? 0) <= 512);
+  assert.match(byId.get('conv/giant-fail')?.item.summary ?? '', /FAIL_HEAD/);
+  assert.match(byId.get('conv/giant-fail')?.item.summary ?? '', /FAIL_TAIL/);
+
+  assert.equal(byId.get('conv/giant-cancel')?.status, 'interrupted');
+  assert.equal(byId.get('conv/giant-cancel')?.item.taskStatus, 'killed');
+  assert.ok((byId.get('conv/giant-cancel')?.item.summary?.length ?? 0) <= 512);
+  assert.match(byId.get('conv/giant-cancel')?.item.summary ?? '', /CANCEL_HEAD/);
+  assert.match(byId.get('conv/giant-cancel')?.item.summary ?? '', /CANCEL_TAIL/);
+});
+
+test('multi-delta agent text keeps pending announcement open past stream overlap until turn/text close or next announcement', t => {
+  for (const closeKind of ['item.textClose', 'turn.boundary']) {
+    const tr = tracker(t, { maxStreamBufferChars: 2048, maxRetainedToolOutputChars: 512 });
+    tr.handleToolEventForThread('t', command('conv/stream-ok', undefined));
+    tr.handleToolEventForThread('t', command('conv/stream-fail', undefined));
+
+    // Stream task 1 with 12 KiB of benign output (far beyond 2048 buffer / 1024 overlap).
+    line(tr, 't', { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: 'Task id "conv/stream-ok" finished with result:\nS_OK_HEAD\n' });
+    for (let i = 0; i < 12; i += 1) {
+      const out = line(tr, 't', { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: 'p'.repeat(1024) });
+      assert.equal(out.filter(d => d.item?.type === 'backgroundTask').length, 0, 'stream-ok must not settle before next announcement or close');
+    }
+    assert.equal(tr.getActiveTasks('t').length, 2);
+
+    // Next announcement arrives: bounds and settles stream-ok as completed, opens stream-fail.
+    const handoff = line(
+      tr,
+      't',
+      { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: '\nS_OK_TAIL\nTask id "conv/stream-fail" finished with result:\nS_FAIL_HEAD\n' },
+      { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: 'q'.repeat(2500) },
+    );
+    const okClose = handoff.find(d => d.item?.type === 'backgroundTask' && d.item.familyId === 'conv/stream-ok');
+    assert.ok(okClose, 'next announcement must settle prior pending task');
+    assert.equal(okClose.status, 'completed');
+    assert.ok(okClose.item.summary.length <= 512);
+    assert.match(okClose.item.summary, /S_OK_HEAD/);
+    assert.match(okClose.item.summary, /S_OK_TAIL/);
+    assert.deepEqual(tr.getActiveTasks('t').map(task => task.taskId), ['conv/stream-fail']);
+
+    // Stream 16 KiB more benign output for stream-fail, then split "Command exited with code 13" across two deltas.
+    for (let i = 0; i < 16; i += 1) {
+      const out = line(tr, 't', { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: 'r'.repeat(1024) });
+      assert.equal(out.filter(d => d.item?.type === 'backgroundTask').length, 0, 'stream-fail must remain pending until close');
+    }
+    line(tr, 't', { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: '\nCommand exited ' });
+    line(tr, 't', { kind: 'item.textDelta', key: { channel: 'assistant' }, channel: 'agentMessage', text: 'with code 13\nS_FAIL_TAIL' });
+    assert.equal(tr.getActiveTasks('t').length, 1);
+
+    const closed = line(tr, 't', closeKind === 'turn.boundary'
+      ? { kind: 'turn.boundary', status: 'completed' }
+      : { kind: 'item.textClose', key: { channel: 'assistant' }, channel: 'agentMessage', text: '' });
+    const failClose = closed.find(d => d.item?.type === 'backgroundTask' && d.item.familyId === 'conv/stream-fail');
+    assert.ok(failClose, `stream-fail must settle on ${closeKind}`);
+    assert.equal(failClose.status, 'failed');
+    assert.ok(failClose.item.summary.length <= 512);
+    assert.match(failClose.item.summary, /S_FAIL_HEAD/);
+    assert.match(failClose.item.summary, /S_FAIL_TAIL/);
+    if (closeKind === 'turn.boundary') {
+      assert.equal(closed.at(-1).kind, 'turn.boundary', 'settled task close must precede turn.boundary');
+    }
+    assert.equal(tr.getActiveTasks('t').length, 0);
+  }
+});
+
 test('stream completion buffers stay bounded on large streamed output and still settle split completions', t => {
   const tr = tracker(t, { maxStreamBufferChars: 2048, maxRetainedToolOutputChars: 512 });
   tr.handleToolEventForThread('t', command('conv/stream-task', undefined));
