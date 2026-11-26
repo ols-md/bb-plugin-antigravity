@@ -227,7 +227,10 @@ test('stream completion buffers span chunks, remain isolated, and flush at text 
     }
     assert.equal(stdout(tr, 'b', { kind: flush }).length, 1);
     const deltas = stdout(tr, 'a', { kind: flush });
-    assert.equal(deltas.at(-1).status, 'failed'); assert.equal(tr.getActiveTasks('b').length, 1);
+    const taskClose = deltas.find(delta => delta.kind === 'item.close');
+    assert.equal(taskClose.status, 'failed');
+    if (flush === 'turn.boundary') assert.equal(deltas.at(-1).kind, 'turn.boundary');
+    assert.equal(tr.getActiveTasks('b').length, 1);
     assert.equal(stdout(tr, 'a', { kind: flush }).length, 1);
     tr.clearThread('b');
   }

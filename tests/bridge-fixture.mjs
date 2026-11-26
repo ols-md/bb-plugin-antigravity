@@ -45,6 +45,7 @@ try {
   assert.match(JSON.stringify(messages), /"Outside of sandbox"/);
 
   if (enabled) {
+    await wait(m => m.params?.deltas?.some(delta => delta.kind === 'turn.boundary'));
     const subagentOptions = {
       ...options,
       providerOptions: { ...options.providerOptions, subagentsDisabled: true },
