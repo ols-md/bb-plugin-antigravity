@@ -314,7 +314,7 @@ test('evicts cached usage when the provider is removed', async () => {
   assert.equal(collections, 2);
 });
 
-test('keeps healthy hosts visible, reports failed inventory, and recovers on retry', async () => {
+test('does not invent a resource on first-ever failed host lookup, recovers on retry, and keeps remembered host visible', async () => {
   let handlers;
   let host2Failing = true;
   const collections = new Map();
@@ -350,20 +350,25 @@ test('keeps healthy hosts visible, reports failed inventory, and recovers on ret
 
   const listResources = handlers['provider-usage.v1.listResources'];
   const getResource = handlers['provider-usage.v1.getResource'];
+  const host2Id = JSON.stringify(['host_2', 'antigravity-cli']);
 
+  // Fresh host whose first-ever provider lookup fails must not invent a resource.
   const firstList = await listResources({});
-  assert.equal(firstList.resources.length, 2);
+  assert.equal(firstList.resources.length, 1);
   assert.equal(firstList.resources[0].scope.hostId, 'host_1');
-  assert.equal(firstList.resources[1].scope.hostId, 'host_2');
 
   const healthyUsage = await getResource({ resourceId: firstList.resources[0].id, refresh: true });
   assert.equal(healthyUsage.usage.status, 'ok');
   assert.equal(healthyUsage.usage.windows.length, 5);
 
-  const failedUsage = await getResource({ resourceId: firstList.resources[1].id, refresh: true });
+  // Direct getResource on an unconfirmed failing host reports error without remembering it.
+  const failedUsage = await getResource({ resourceId: host2Id, refresh: true });
   assert.equal(failedUsage.usage.status, 'error');
   assert.equal(failedUsage.observedAt, null);
+  const stillUnconfirmedList = await listResources({});
+  assert.equal(stillUnconfirmedList.resources.length, 1);
 
+  // Once the fresh host succeeds, it appears in inventory and is remembered.
   host2Failing = false;
   const recoveredList = await listResources({});
   assert.equal(recoveredList.resources.length, 2);
@@ -374,6 +379,13 @@ test('keeps healthy hosts visible, reports failed inventory, and recovers on ret
   assert.equal(recoveredUsage.usage.windows.length, 5);
   assert.equal(collections.get('host_1'), 1);
   assert.equal(collections.get('host_2'), 1);
+
+  // Subsequent transient failure on the remembered host preserves its inventory entry and label.
+  host2Failing = true;
+  const rememberedList = await listResources({});
+  assert.equal(rememberedList.resources.length, 2);
+  assert.equal(rememberedList.resources[1].scope.hostId, 'host_2');
+  assert.equal(rememberedList.resources[1].label, 'Antigravity CLI (Remote)');
 });
 
 test('preserves cached observations across transient host lookup failures and evicts only on confirmed removal', async () => {

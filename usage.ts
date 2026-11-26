@@ -359,6 +359,8 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
   const isOwnedUsageProvider = (provider: { id: string; pluginId?: string | null }) =>
     provider.id === PROVIDER_ID && provider.pluginId === expectedPluginId;
 
+  const toResourceId = (hostId: string) => JSON.stringify([hostId, PROVIDER_ID]);
+
   const evictResource = (resourceId: string) => {
     cache.delete(resourceId);
     knownResources.delete(resourceId);
@@ -371,7 +373,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
   };
 
   const toUsageResource = (host: { id: string; name: string }, label?: string): UsageResource => {
-    const id = JSON.stringify([host.id, PROVIDER_ID]);
+    const id = toResourceId(host.id);
     const remembered = knownResources.get(id);
     return {
       id,
@@ -516,8 +518,8 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
               confirmedResourceIds.add(resource.id);
               resources.push(resource);
             }
-          } else {
-            // Preserve failed-host visibility without evicting cached state; confirmed removal happens only on fulfilled empty inventory or missing host.
+          } else if (knownResources.has(toResourceId(host.id))) {
+            // Preserve previously confirmed host visibility without inventing resources for unconfirmed hosts.
             resources.push(toUsageResource(host));
           }
         }
