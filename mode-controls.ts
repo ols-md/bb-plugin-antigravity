@@ -1,6 +1,7 @@
 import type { AvailableModel } from "@get-bb/plugin-sdk/provider-bridge";
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { addAntigravityHealthDiagnostic } from "./cli.ts";
 
 // Keep native mode IDs so the shared bridge can apply the selection unchanged.
 function workModes(options: NonNullable<AvailableModel["sessionOptions"]>) {
@@ -15,9 +16,11 @@ function workModes(options: NonNullable<AvailableModel["sessionOptions"]>) {
   });
 }
 
-export function presentModeControls(line: string): string {
+export function presentProviderOutput(line: string): string {
   let message;
   try { message = JSON.parse(line); } catch { return line; }
+  // The shared bridge already ran the version probe for provider/health.
+  if (message?.jsonrpc === "2.0") addAntigravityHealthDiagnostic(message.result);
   if (Array.isArray(message?.result?.models)) {
     for (const model of [...message.result.models, ...(Array.isArray(message.result.selectedOnlyModels) ? message.result.selectedOnlyModels : [])]) {
       if (Array.isArray(model.sessionOptions)) model.sessionOptions = workModes(model.sessionOptions);
@@ -39,8 +42,8 @@ export function modeControlOutput(
   const decoder = new StringDecoder("utf8");
   let pending = "";
   const emit = (stream: Transform, line: string, trailingNewline: boolean) => {
-    const modeLine = presentModeControls(line);
-    const lines = transformLines ? transformLines(modeLine) : [modeLine];
+    const presented = presentProviderOutput(line);
+    const lines = transformLines ? transformLines(presented) : [presented];
     for (const out of lines) {
       stream.push(trailingNewline ? `${out}\n` : out);
     }

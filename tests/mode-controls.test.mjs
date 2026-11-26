@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { presentModeControls, modeControlOutput } from '../mode-controls.ts';
+import { presentProviderOutput, modeControlOutput } from '../mode-controls.ts';
 import { mapPromptMode } from '../prompt-mode.ts';
 
 const mode = { id: 'mode', type: 'select', label: 'Mode', value: 'default', values: [
@@ -14,7 +14,7 @@ test('catalog and live session updates present exactly Build and Plan', () => {
       {kind: 'extension.state', extensionKind: 'bb/session-options', payload: {options: [{...mode, value}, other]}},
       {kind: 'text', text: 'Default and Accept edits are words in a reply'},
     ]}};
-    const result = JSON.parse(presentModeControls(JSON.stringify(message)));
+    const result = JSON.parse(presentProviderOutput(JSON.stringify(message)));
     for (const options of [result.result.models[0].sessionOptions, result.params.deltas[0].payload.options]) {
       assert.deepEqual(options[0].values.map(v => v.label), ['Build', 'Plan']);
       assert.equal(options[0].value, value === 'plan' ? 'plan' : 'accept-edits');

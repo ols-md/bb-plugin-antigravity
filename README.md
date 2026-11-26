@@ -20,7 +20,7 @@ This experimental provider is available in the BB Community marketplace. It has 
 
 You need BB 0.48 or later, Node.js 22 or later, and an eligible Antigravity account. Antigravity quota and charges apply.
 
-Install the standalone Antigravity CLI (`agy`) on the machine where the agent runs. If you use a remote agent host, install it there. [Google's CLI installation instructions](https://antigravity.google/docs/getting-started?tab=cli)
+Install the standalone Antigravity CLI (`agy`) on the machine where the agent runs. If you use a remote agent host, install it there. Use version 1.5.0 or later for ACP. [Google's CLI installation instructions](https://antigravity.google/docs/getting-started?tab=cli)
 
 Check the CLI version and ACP support on the agent host.
 
@@ -133,11 +133,14 @@ Automatic CLI installation, conversation forking, manual compaction, and native 
 | Antigravity is missing | Enable the installed plugin and its **Show in provider picker** setting. |
 | `agy` cannot be found | See [Windows CLI recovery](#windows-cli-recovery). Install the standalone CLI on the agent host; the plugin also checks its standard install location. |
 | Sign-in is required or expired | Run `agy acp --login` on the agent host, then retry. |
-| ACP is unavailable | Update the CLI and confirm `agy acp --help` works. |
+| Provider health reports an old CLI | Run `agy update` on the agent host. Check provider health again. |
+| ACP is unavailable | Run `agy acp --help` on the agent host. |
 | Model list is empty | Check CLI sign-in, connectivity, and account eligibility, then refresh providers. |
 | Commands run without asking | Check automatic approval in plugin settings, BB's permission selection, and the CLI's own permission rules. Full access auto-approves ACP requests. |
 
 When reporting an issue, include BB/CLI versions and a short reproduction. Remove tokens, account details, private paths, and conversation content from logs.
+
+The health diagnostic uses the version reported by the selected CLI. If the version check fails or returns an unrecognized version, BB can still report the CLI as ready. The version check alone cannot confirm ACP startup, sign-in, or feature support.
 
 ### Windows CLI recovery
 
