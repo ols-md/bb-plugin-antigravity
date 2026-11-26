@@ -16,7 +16,7 @@ Verified against Antigravity CLI 1.5.1 and BB SDK 0.6.109 on Windows. A terminal
 | Separate child sessions | Distinct ACP session IDs verified; actual concurrent agent work not tested |
 | Existing session load | Native session/load verified; full BB restart recovery not tested |
 | Session fork/rewind | Disabled: CLI initialize does not advertise session/fork |
-| Manual compaction | Disabled: sending /compact returned conversational text; actual compaction not established |
+| Manual compaction | Disabled. On Windows, CLI 1.5.18 ended the `/compact` turn without a compaction result in both an empty session and a resumed session with history. The empty session also displayed a quota warning. BB needs a completion signal before it can report success. |
 | Subscription quota/usage | Supported via `agy -p "/usage" --output-format json` and `provider-usage.v1` |
 | Native archive/rename | Disabled: bridge does not implement these operations |
 | BB Auto permission profile | Unsupported by the shared ACP bridge |

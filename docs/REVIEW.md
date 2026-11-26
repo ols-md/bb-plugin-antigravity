@@ -10,4 +10,6 @@ Reviewed the provider declaration, host entry, tests, smoke script, manifest, lo
 
 Verified on Windows: TypeScript check, launch-policy regression test, BB build and plugin reload, live model/mode discovery, and native ACP initialize/session/new/prompt against the installed signed-in CLI. The prompt returned the requested marker without tool access.
 
-Public source metadata, Git-source installation, and the BB Community marketplace listing (`antigravity-cli`) are published. Validation outside Windows (macOS and Linux) remains open.
+Public source metadata, Git-source installation, and the BB Community marketplace listing (`antigravity-cli`) are published.
+
+Ubuntu CI runs the typecheck and test suite with Node 24. A contributor reported live sessions on an Unraid Linux fork with Node 26 and Antigravity CLI 1.5.14. A signed-in test of the released plugin on Linux and a macOS runtime test remain open. [Linux test environment](https://github.com/mturilin/bb-plugin-antigravity/commit/3323a3a40445e58d62a70a24ca242e4e3fdcfd4c)
