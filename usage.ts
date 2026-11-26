@@ -355,20 +355,33 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
   const cache = new Map<string, CachedObservation>();
   const knownResources = new Map<string, UsageResource>();
   const inflight = new Map<string, { refresh: boolean; promise: Promise<CachedObservation> }>();
+  let mutationSeq = 0;
+  const confirmedAt = new Map<string, number>();
+  const evictedAt = new Map<string, number>();
+  let latestHostSnapshot: { seq: number; hostIds: Set<string> } | null = null;
 
   const isOwnedUsageProvider = (provider: { id: string; pluginId?: string | null }) =>
     provider.id === PROVIDER_ID && provider.pluginId === expectedPluginId;
 
   const toResourceId = (hostId: string) => JSON.stringify([hostId, PROVIDER_ID]);
 
-  const evictResource = (resourceId: string) => {
-    cache.delete(resourceId);
-    knownResources.delete(resourceId);
+  const confirmResource = (resource: UsageResource, seq = ++mutationSeq): boolean => {
+    if (seq < (evictedAt.get(resource.id) ?? 0)) return false;
+    knownResources.set(resource.id, resource);
+    confirmedAt.set(resource.id, Math.max(confirmedAt.get(resource.id) ?? 0, seq));
+    return true;
   };
 
-  const evictHost = (hostId: string) => {
-    for (const id of new Set([...cache.keys(), ...knownResources.keys()])) {
-      if (resourceHostId(id) === hostId) evictResource(id);
+  const evictResource = (resourceId: string, seq = ++mutationSeq) => {
+    if (seq < (confirmedAt.get(resourceId) ?? 0)) return;
+    cache.delete(resourceId);
+    knownResources.delete(resourceId);
+    evictedAt.set(resourceId, Math.max(evictedAt.get(resourceId) ?? 0, seq));
+  };
+
+  const evictHost = (hostId: string, seq = ++mutationSeq) => {
+    for (const id of new Set([...cache.keys(), ...knownResources.keys(), toResourceId(hostId)])) {
+      if (resourceHostId(id) === hostId) evictResource(id, seq);
     }
   };
 
@@ -407,12 +420,17 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         },
       });
 
+    const isEvictedSince = (hostSeq: number, providerSeq: number) =>
+      (evictedAt.get(resourceId) ?? 0) > providerSeq ||
+      (latestHostSnapshot !== null && latestHostSnapshot.seq > hostSeq && !latestHostSnapshot.hostIds.has(hostId));
+
+    const hostCheckSeq = ++mutationSeq;
     let host: Awaited<ReturnType<typeof bb.sdk.hosts.get>>;
     try {
       host = await bb.sdk.hosts.get({ hostId });
     } catch (error: unknown) {
       if (isNotFoundError(error)) {
-        evictHost(hostId);
+        evictHost(hostId, hostCheckSeq);
         throw new Error("Usage resource no longer exists.");
       }
       return unavailable("Usage could not be collected from this machine.");
@@ -422,6 +440,7 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       return unavailable("Machine is disconnected.");
     }
 
+    const providerCheckSeq = ++mutationSeq;
     let providers: Awaited<ReturnType<typeof bb.sdk.providers.list>>;
     try {
       providers = await bb.sdk.providers.list({ hostId, capability: "usage" });
@@ -431,10 +450,15 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
 
     const matchedProvider = providers.find(isOwnedUsageProvider);
     if (!matchedProvider) {
-      evictResource(resourceId);
+      evictResource(resourceId, providerCheckSeq);
       throw new Error("Usage resource no longer exists.");
     }
-    knownResources.set(resourceId, toUsageResource(host, matchedProvider.displayName));
+    if (
+      isEvictedSince(hostCheckSeq, providerCheckSeq) ||
+      !confirmResource(toUsageResource(host, matchedProvider.displayName), providerCheckSeq)
+    ) {
+      throw new Error("Usage resource no longer exists.");
+    }
 
     if (
       !refresh &&
@@ -445,14 +469,17 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
       return previous;
     }
 
+    let result: CachedObservation;
+    let rawStatus: string;
     try {
       const limits = await bb.sdk.system.usageLimits({ hostId, providerId, refresh });
       const rawUsage = limits[providerId];
       if (!rawUsage) {
         throw new Error("Provider returned no usage information.");
       }
+      rawStatus = rawUsage.status;
       const rawRecord = rawUsage as Record<string, unknown>;
-      const result = getResourceOutputSchema.parse({
+      result = getResourceOutputSchema.parse({
         accountKey: previous?.accountKey ?? null,
         observedAt: rawUsage.status === "ok" ? Date.now() : previous?.observedAt ?? null,
         usage: {
@@ -471,13 +498,20 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
             : {}),
         },
       });
-      if (rawUsage.status !== "error" || previous?.usage.status !== "ok") {
-        cache.set(resourceId, result);
-      }
-      return result;
     } catch {
+      if (isEvictedSince(hostCheckSeq, providerCheckSeq)) {
+        throw new Error("Usage resource no longer exists.");
+      }
       return unavailable("Usage could not be collected from this machine.");
     }
+
+    if (isEvictedSince(hostCheckSeq, providerCheckSeq)) {
+      throw new Error("Usage resource no longer exists.");
+    }
+    if (rawStatus !== "error" || previous?.usage.status !== "ok") {
+      cache.set(resourceId, result);
+    }
+    return result;
   };
 
   const collectResource = async (resourceId: string, refresh: boolean): Promise<CachedObservation> => {
@@ -498,9 +532,14 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
     providerUsageSourceContract,
     {
       async [LIST_RESOURCES_METHOD]() {
+        const snapshotSeq = ++mutationSeq;
         const hosts = await bb.sdk.hosts.list();
+        const connectedHosts = hosts.filter(host => host.status !== "disconnected");
         const settled = await Promise.allSettled(
-          hosts.map(host => bb.sdk.providers.list({ hostId: host.id, capability: "usage" })),
+          connectedHosts.map(host => bb.sdk.providers.list({ hostId: host.id, capability: "usage" })),
+        );
+        const outcomesByHostId = new Map(
+          connectedHosts.map((host, index) => [host.id, settled[index]] as const),
         );
 
         const resources: UsageResource[] = [];
@@ -508,15 +547,22 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
         const confirmedHostIds = new Set<string>();
         const confirmedResourceIds = new Set<string>();
 
-        for (const [index, host] of hosts.entries()) {
-          const outcome = settled[index];
+        for (const host of hosts) {
+          if (host.status === "disconnected") {
+            if (knownResources.has(toResourceId(host.id))) {
+              resources.push(toUsageResource(host));
+            }
+            continue;
+          }
+          const outcome = outcomesByHostId.get(host.id)!;
           if (outcome.status === "fulfilled") {
             confirmedHostIds.add(host.id);
             for (const provider of outcome.value.filter(isOwnedUsageProvider)) {
               const resource = toUsageResource(host, provider.displayName);
-              knownResources.set(resource.id, resource);
-              confirmedResourceIds.add(resource.id);
-              resources.push(resource);
+              if (confirmResource(resource, snapshotSeq)) {
+                confirmedResourceIds.add(resource.id);
+                resources.push(resource);
+              }
             }
           } else if (knownResources.has(toResourceId(host.id))) {
             // Preserve previously confirmed host visibility without inventing resources for unconfirmed hosts.
@@ -524,12 +570,23 @@ export function registerAntigravityUsageSource(bb: BbPluginApi) {
           }
         }
 
+        if (!latestHostSnapshot || snapshotSeq > latestHostSnapshot.seq) {
+          latestHostSnapshot = { seq: snapshotSeq, hostIds: liveHostIds };
+        }
+
+        for (const hostId of confirmedHostIds) {
+          const expectedId = toResourceId(hostId);
+          if (!confirmedResourceIds.has(expectedId)) {
+            evictResource(expectedId, snapshotSeq);
+          }
+        }
+
         for (const cachedId of new Set([...cache.keys(), ...knownResources.keys()])) {
           const hostId = resourceHostId(cachedId);
           if (!hostId || !liveHostIds.has(hostId)) {
-            evictResource(cachedId);
+            evictResource(cachedId, snapshotSeq);
           } else if (confirmedHostIds.has(hostId) && !confirmedResourceIds.has(cachedId)) {
-            evictResource(cachedId);
+            evictResource(cachedId, snapshotSeq);
           }
         }
 
