@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { Server } from 'node:net';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -626,7 +627,8 @@ test('concurrent writer processes preserve all saved tasks and both threads reco
 });
 
 test('a paused live writer is never evicted and a contended writer flushes via scheduled retry', async t => {
-  const path = statePath(t);
+  // Exercise the short-alias path for Unix sockets even with a short temp directory.
+  const path = join(dirname(statePath(t)), 'background-task-state-with-a-long-filename-for-socket-recovery.json');
   const holder = spawnWriter(t);
   const waiter = spawnWriter(t);
   await Promise.all([holder.ready, waiter.ready]);
@@ -670,7 +672,8 @@ test('a paused live writer is never evicted and a contended writer flushes via s
 });
 
 test('a crashed lock owner is pruned safely and racing writers both persist without losing records', async t => {
-  const path = statePath(t);
+  // Exercise the short-alias path for Unix sockets even with a short temp directory.
+  const path = join(dirname(statePath(t)), 'background-task-state-with-a-long-filename-for-socket-recovery.json');
   const lockDir = `${path}.locks`;
   writeFileSync(path, `${JSON.stringify({
     version: 1,
@@ -689,10 +692,15 @@ test('a crashed lock owner is pruned safely and racing writers both persist with
   });
   crashedRequest.catch(() => {});
   await locked;
-  assert.equal(readdirSync(lockDir).length, 1);
+  assert.equal(readdirSync(lockDir).filter(name => name.endsWith('.lock')).length, 1);
   await crashed.killNow();
-  assert.equal(readdirSync(lockDir).length, 1, 'crashed process leaves its marker behind');
+  assert.equal(readdirSync(lockDir).filter(name => name.endsWith('.lock')).length, 1, 'crashed process leaves its marker behind');
 
+  // Model PID reuse by giving the abandoned marker a live PID and its prior owner's identity.
+  const abandoned = readdirSync(lockDir).find(name => name.endsWith('.lock'));
+  assert.match(abandoned, /^\d+-ab-/);
+  const reused = abandoned.replace(/^\d+/, String(process.pid));
+  renameSync(join(lockDir, abandoned), join(lockDir, reused));
   // 2. Also add a second dead-PID marker and race two independent writers to recover and save.
   const deadPid = await createDeadPid();
   writeFileSync(join(lockDir, `${deadPid}-${randomUUID()}.lock`), '');
@@ -738,6 +746,16 @@ test('concurrent startup GC with a live writer preserves new and fresh legacy ta
   assert.deepEqual(readdirSync(`${path}.locks`), []);
 });
 
+test('a failed listener cannot publish a marker or enter the critical section', t => {
+  const path = statePath(t);
+  const listen = Server.prototype.listen;
+  // Binding in a missing directory fails. Node can still report the attempted pipe name.
+  t.mock.method(Server.prototype, 'listen', function () {
+    return listen.call(this, join(path, 'missing', 'socket'));
+  });
+  assert.deepEqual(withTaskStateLock(path, () => assert.fail('entered without a listener')), { status: 'transient' });
+  assert.deepEqual(readdirSync(`${path}.locks`), []);
+});
 test('live lock markers are never evicted by age and yielding removes only the caller marker', t => {
   const path = statePath(t);
   const lockDir = `${path}.locks`;
@@ -1043,7 +1061,7 @@ test('Windows transient marker I/O uses bounded exponential backoff for lock acq
     { status: 'acquired', value: 'ok' },
   );
   assert.equal(unlinkAttempts, 1);
-  assert.equal(readdirSync(lockDir).length, 1);
+  assert.equal(readdirSync(lockDir).filter(name => name.endsWith('.lock')).length, 1);
   t.mock.timers.tick(9);
   assert.equal(unlinkAttempts, 1);
   t.mock.timers.tick(1); // 10ms
