@@ -12,6 +12,9 @@ test('registers a native ACP provider without changing credentials or bypassing 
         assert.equal(descriptors.sandbox.default, false);
         assert.equal(descriptors.subagentsDisabled.default, false);
         assert.equal(descriptors.commandDescriptionsEnabled.default, true);
+        assert.equal(descriptors.profileRoutingEnabled.type, 'boolean');
+        assert.equal(descriptors.profileRoutingEnabled.label, 'Enable Antigravity profile routing');
+        assert.equal(descriptors.profileRoutingEnabled.default, false);
         assert.equal(descriptors.enabled.default, true);
         return { get: async () => ({ enabled: true }), onChange() {} };
       },
@@ -63,6 +66,13 @@ test('sandbox is opt-in and only changes fixed CLI arguments', async () => {
     assert.equal(
       provider.deriveProviderOptions({ settings: { commandDescriptionsEnabled } }).commandDescriptionsEnabled,
       commandDescriptionsEnabled !== false
+    );
+  }
+  assert.equal(provider.deriveProviderOptions({ settings: {} }).profileRoutingEnabled, false);
+  for (const profileRoutingEnabled of [false, true, 'true']) {
+    assert.equal(
+      provider.deriveProviderOptions({ settings: { profileRoutingEnabled } }).profileRoutingEnabled,
+      profileRoutingEnabled === true
     );
   }
   assert.ok(provider.experimental_nativeSkillRoots.user.includes('.gemini/antigravity-cli/skills'));

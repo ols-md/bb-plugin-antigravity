@@ -17,6 +17,7 @@
     "server.ts",
     "host.ts",
     "cli.ts",
+    "profile-bindings.ts",
     "compaction.ts",
     "background-tasks.ts",
     "subagents.ts",

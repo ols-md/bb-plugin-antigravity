@@ -123,6 +123,16 @@ The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. O
 
 If the tool sends a request to run a command outside the sandbox, the command card shows the **Outside of sandbox** badge. When **Show command descriptions** is off, the card shows this badge for these requests.
 
+**Enable Antigravity profile routing** is off by default. When profile routing is off, new sessions use the agent host's Antigravity login. BB Usage reports quota for the host login even when profile routing is on.
+
+To select an Antigravity profile for a session, turn on profile routing in Settings or run this command.
+
+```sh
+bb plugin config antigravity-cli set profileRoutingEnabled true
+```
+
+Use `BB_ANTIGRAVITY_GEMINI_DIR` to provide the absolute path of the Gemini directory on the agent host. Use `BB_ANTIGRAVITY_APP_DATA_DIR` to select the app data directory by name. The default name is `antigravity-cli`. Start a new thread to use the selected profile. When routing is off, BB blocks new turns and resume requests for routed sessions. To resume a routed session, turn routing back on and use the original profile. Manual compaction currently verifies checkpoints only on the default Antigravity profile.
+
 The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
 ## Limitations
