@@ -46,7 +46,7 @@ export function createCompactionVerifier(home = hostHomeDirectory()) {
   // The SDK can await session options before marking a turn active.
   const starting = new Map<string | number, string>();
   return {
-    prepare(request: any, routed = false): string | undefined {
+    prepare(request: any): string | undefined {
       if (request?.method === "thread/stop") {
         const attempt = pending.get(request.params?.threadId);
         if (attempt && !attempt.stop && threadStopParamsSchema.safeParse(request.params).success) {
@@ -63,7 +63,6 @@ export function createCompactionVerifier(home = hostHomeDirectory()) {
         starting.set(request.id, threadId);
         return;
       }
-      if (routed) return "Manual compaction currently requires the default Antigravity profile.";
       if ([...starting.values()].includes(threadId)) return "Wait for the current turn to finish before compacting.";
       if (!home || !sessionIdPattern.test(providerThreadId)) return unconfirmed;
       const path = join(home, ".gemini", "antigravity-cli", "brain", providerThreadId,

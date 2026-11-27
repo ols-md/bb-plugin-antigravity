@@ -48,6 +48,8 @@ agy acp --login
 
 Follow the sign-in prompts. The plugin checks `PATH` first, then the standard CLI install location (`%LOCALAPPDATA%\agy\bin\agy.exe` on Windows or `~/.local/bin/agy` on macOS and Linux).
 
+BB uses the Antigravity login on the agent host for sessions and usage reporting.
+
 ### 2. Install the plugin
 
 In BB, open **Plugins** from the navigation rail. In the Community marketplace, find **Antigravity CLI Provider [Experimental]** and select **Install**. You can also install it from the command line.
@@ -123,16 +125,6 @@ The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. O
 
 If the tool sends a request to run a command outside the sandbox, the command card shows the **Outside of sandbox** badge. When **Show command descriptions** is off, the card shows this badge for these requests.
 
-**Enable Antigravity profile routing** is off by default. When profile routing is off, new sessions use the agent host's Antigravity login. BB Usage reports quota for the host login even when profile routing is on.
-
-To select an Antigravity profile for a session, turn on profile routing in Settings or run this command.
-
-```sh
-bb plugin config antigravity-cli set profileRoutingEnabled true
-```
-
-Use `BB_ANTIGRAVITY_GEMINI_DIR` to provide the absolute path of the Gemini directory on the agent host. Use `BB_ANTIGRAVITY_APP_DATA_DIR` to select the app data directory by name. The default name is `antigravity-cli`. Start a new thread to use the selected profile. When routing is off, BB blocks new turns and resume requests for routed sessions. To resume a routed session, turn routing back on and use the original profile. Manual compaction currently verifies checkpoints only on the default Antigravity profile.
-
 The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
 ## Limitations
@@ -150,6 +142,7 @@ Automatic CLI installation, conversation forking, and native thread archive/rena
 | Antigravity is missing | Enable the installed plugin and its **Show in provider picker** setting. |
 | `agy` cannot be found | See [Windows CLI recovery](#windows-cli-recovery). Install the standalone CLI on the agent host; the plugin also checks its standard install location. |
 | Sign-in is required or expired | Run `agy acp --login` on the agent host, then retry. |
+| BB reports that Antigravity profile routing was removed | Start a new Antigravity thread. The earlier conversation remains in BB. |
 | Provider health reports an old CLI | Run `agy update` on the agent host. Check provider health again. |
 | ACP is unavailable | Run `agy acp --help` on the agent host. |
 | Model list is empty | Check CLI sign-in, connectivity, and account eligibility, then refresh providers. |

@@ -11,15 +11,7 @@ import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
 import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
-import { prepareAntigravityProfile, resolveAntigravityLaunchSpec } from "./cli.ts";
-import {
-  ANTIGRAVITY_INVALID_PROFILE_MESSAGE,
-  ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE,
-  decodeProfileSessionId,
-  encodeProfileSessionId,
-  hashAntigravityProfile,
-  matchesProfileSessionId,
-} from "./profile-bindings.ts";
+import { resolveAntigravityLaunchSpec } from "./cli.ts";
 import { createCompactionVerifier } from "./compaction.ts";
 
 registerAntigravityAcpDialect();
@@ -103,178 +95,20 @@ function missingCliResponse(method: unknown) {
 let stdoutFilterInstalled = false;
 const autoApproveThreads = new Map<string, boolean>();
 const commandDescriptionsThreads = new Map<string, boolean>();
-type PendingIdentity = { threadId: string; profileHash?: string; stop?: true };
-type SessionIdentity = { profileHash?: string; sessionId: string };
-const pendingIdentities = new Map<string | number, PendingIdentity>();
-const activeIdentities = new Map<string, SessionIdentity>();
-const pendingInputs = new Map<string | number, { threadId: string; clientRequestId: string; steer: boolean }>();
-type ClosingSession = {
-  id: string | number;
-  line: string;
-  pastEarlyAck: boolean;
-  phase: "first-stop" | "waiting-for-input" | "final-stop";
-};
-const closingSessions = new Map<string, ClosingSession>();
 
-function pendingIdentityForThread(threadId: string): PendingIdentity | undefined {
-  for (const pending of pendingIdentities.values()) {
-    if (pending.threadId === threadId) return pending;
-  }
-}
-
-function profileError(message: string) {
-  return { code: -32000, message };
-}
-
-function hasPendingRoutedWork(threadId: string): boolean {
-  return [...pendingIdentities.values()].some(request =>
-    request.threadId === threadId && !request.stop && request.profileHash !== undefined) ||
-    [...pendingInputs.values()].some(input => input.threadId === threadId);
-}
-
-function finishClosingSession(threadId: string): void {
-  const closing = closingSessions.get(threadId);
-  if (closing?.phase !== "waiting-for-input" || hasPendingRoutedWork(threadId)) return;
-  // SDK output is synchronous. Let the current SDK operation finish before forwarding stop.
-  queueMicrotask(() => {
-    if (closing.phase !== "waiting-for-input" || hasPendingRoutedWork(threadId)) return;
-    closing.phase = "final-stop";
-    pendingIdentities.set(closing.id, { threadId, stop: true });
-    experimental_acpProviderBridge.handleLine(closing.line);
-  });
-}
-
-function settlePendingInputs(message: any): void {
-  if (message.method === undefined) {
-    const input = pendingInputs.get(message.id);
-    if (input && (!input.steer || message.error)) {
-      pendingInputs.delete(message.id);
-      finishClosingSession(input.threadId);
-    }
-    return;
-  }
-  const threadId = message.params?.threadId;
-  const deltas = message.method === "thread/delta" && Array.isArray(message.params?.deltas) ? message.params.deltas : [];
-  if (typeof threadId !== "string" || (deltas.length === 0 && message.method !== "error")) return;
-  // The SDK acknowledges ordinary steers when queued. Acceptance or turn termination
-  // is what establishes that the SDK can no longer rebuild to execute that input.
-  const ended = message.method === "error" || deltas.some((delta: any) => delta.kind === "turn.boundary");
-  for (const [id, input] of pendingInputs) {
-    if (input.threadId !== threadId || !input.steer) continue;
-    if (ended || deltas.some((delta: any) => delta.kind === "input.accepted" && delta.clientRequestId === input.clientRequestId)) {
-      pendingInputs.delete(id);
-    }
-  }
-  finishClosingSession(threadId);
-}
-
-function wrapProfileSessionIds(line: string): string | null {
-  let message: any;
-  try { message = JSON.parse(line); } catch { return line; }
-  if (message?.jsonrpc !== "2.0") return line;
-  if (pendingInputs.size > 0) settlePendingInputs(message);
-
-  if (message.method === undefined) {
-    const pending = pendingIdentities.get(message.id);
-    if (!pending) return line;
-    pendingIdentities.delete(message.id);
-    const { threadId, profileHash, stop } = pending;
-    if (stop) {
-      const closing = closingSessions.get(threadId);
-      if (closing?.phase === "first-stop" && message.result?.ok === true) {
-        if (closing.pastEarlyAck) {
-          // The SDK reached a session and dropped its queue before awaiting process exit.
-          // Dropped steers have no completion notification.
-          for (const [id, input] of pendingInputs) {
-            if (input.threadId === threadId && input.steer) pendingInputs.delete(id);
-          }
-        }
-        closing.phase = "waiting-for-input";
-        finishClosingSession(threadId);
-        return null;
-      }
-      closingSessions.delete(threadId);
-      if (message.result?.ok === true) activeIdentities.delete(threadId);
-      return line;
-    }
-    finishClosingSession(threadId);
-    if (message.error) return line;
-    const sessionId = message.result?.providerThreadId;
-    if (typeof sessionId !== "string" || !sessionId) {
-      if (profileHash === undefined) return line;
-      return JSON.stringify({ jsonrpc: "2.0", id: message.id, error: profileError(ANTIGRAVITY_INVALID_PROFILE_MESSAGE) });
-    }
-    activeIdentities.set(threadId, { profileHash, sessionId });
-    if (profileHash === undefined) return line;
-    message.result.providerThreadId = encodeProfileSessionId(threadId, sessionId, profileHash);
-    return JSON.stringify(message);
-  }
-
-  const { threadId, providerThreadId } = message.params ?? {};
-  if (typeof threadId !== "string" || typeof providerThreadId !== "string") return line;
-  const active = activeIdentities.get(threadId);
-  const pending = pendingIdentityForThread(threadId);
-  if (!active && (!pending || pending.stop)) return null;
-  if (message.method === "thread/identity" || message.method === "session/replaced") {
-    if (closingSessions.has(threadId) || pending?.stop) return null;
-  }
-  const profileHash = active?.profileHash ?? pending?.profileHash;
-  // BB persists this SDK notification when a process rebuild changes the native session ID.
-  if (message.method === "session/replaced" && active) active.sessionId = providerThreadId;
-  if (profileHash === undefined) return line;
-  message.params.providerThreadId = encodeProfileSessionId(threadId, providerThreadId, profileHash);
-  return JSON.stringify(message);
-}
-
-function guardProfileSession(request: Record<string, any> | null): string | undefined {
-  const params = request?.params;
-  const threadId = params?.threadId;
-  if (typeof threadId !== "string") return;
+function unsupportedSessionMessage(request: Record<string, any> | null): string | undefined {
   const method = request?.method;
-  const id = request?.jsonrpc === "2.0" && (typeof request.id === "string" || typeof request.id === "number")
-    ? request.id : undefined;
+  const params = request?.params;
   if (method === "thread/fork") return "Antigravity does not support forking threads.";
-  if ((closingSessions.has(threadId) || pendingIdentityForThread(threadId)?.stop) && method !== "thread/discard") {
-    return "Antigravity is stopping this session. Try again when it has stopped.";
+  if (method !== "thread/start" && method !== "thread/resume" && method !== "turn/start" && method !== "turn/steer") return;
+
+  if (typeof params?.providerThreadId === "string" && params.providerThreadId.startsWith("antigravity-profile:")) {
+    return "Antigravity profile routing was removed. Start a new Antigravity thread.";
   }
-
-  const sessionId = decodeProfileSessionId(params.providerThreadId);
-  if (method === "thread/stop" || method === "thread/discard") {
-    if (sessionId) params.providerThreadId = sessionId.sessionId;
-    // The SDK acknowledges discard without releasing its live session. Wait for stop.
-    if (method === "thread/stop" && id !== undefined) pendingIdentities.set(id, { threadId, stop: true });
-    return;
-  }
-  const startsSession = method === "thread/start" || method === "thread/resume";
-  if (!startsSession && method !== "turn/start" && method !== "turn/steer") return;
-
-  if (pendingIdentityForThread(threadId)) return "Antigravity is updating this session. Try again when it is ready.";
-  const profile = prepareAntigravityProfile(params.options);
-  if (sessionId === null || (sessionId && profile == null)) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
-  if (profile === null) return ANTIGRAVITY_INVALID_PROFILE_MESSAGE;
-  const profileHash = profile === undefined ? undefined : hashAntigravityProfile(profile);
-  const active = activeIdentities.get(threadId);
-  if (active && active.profileHash !== profileHash) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
-
-  if (method === "thread/start") {
-    if (active?.profileHash || sessionId !== undefined) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
-  } else if (sessionId) {
-    if (profileHash === undefined || !matchesProfileSessionId(threadId, sessionId, profileHash)) {
-      return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
-    }
-    if (active && active.sessionId !== sessionId.sessionId) {
-      return "This Antigravity session was replaced. Retry with the current session.";
-    }
-    params.providerThreadId = sessionId.sessionId;
-  } else if (profileHash !== undefined) {
-    return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
-  }
-
-  if (startsSession) {
-    if (id === undefined) return ANTIGRAVITY_INVALID_PROFILE_MESSAGE;
-    pendingIdentities.set(id, { threadId, profileHash });
-  } else if (!active) {
-    return "No active ACP session.";
+  const args = params?.options?.providerOptions?.acpLaunchSpec?.args;
+  if (Array.isArray(args) && args[0] === "acp" && args.some(arg =>
+    typeof arg === "string" && /^--(?:gemini[-_]dir|app[-_]data[-_]dir)(?:=|$)/.test(arg))) {
+    return "Antigravity profile overrides are no longer supported.";
   }
 }
 
@@ -371,12 +205,9 @@ function ensureStdoutFilter() {
   rawStdoutWrite = write;
   const output = modeControlOutput(
     interceptApproval,
-    line => {
-      const wrapped = wrapProfileSessionIds(line);
-      return wrapped === null ? [] : backgroundTaskTracker.processStdoutLine(
-        applyThreadCommandDescriptions(wrapped, commandDescriptionsThreads),
-      );
-    },
+    line => backgroundTaskTracker.processStdoutLine(
+      applyThreadCommandDescriptions(line, commandDescriptionsThreads),
+    ),
     compaction.verify,
   );
   output.on("data", chunk => write(chunk));
@@ -396,20 +227,19 @@ export const experimental_providerBridge = {
     const request = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as Record<string, any>)
       : null;
-    if (request?.method !== "initialize" && !resolveAntigravityLaunchSpec(parsed)) {
+    const unsupportedSession = unsupportedSessionMessage(request);
+    if (unsupportedSession) {
       const id = request?.id;
       if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
-        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...missingCliResponse(request.method) })}\n`);
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: unsupportedSession } })}\n`);
       }
       return;
     }
 
-    // A held steer becomes turn/start with the same session reference and execution options.
-    const profileRejection = guardProfileSession(request);
-    if (profileRejection) {
+    if (request?.method !== "initialize" && !resolveAntigravityLaunchSpec(parsed)) {
       const id = request?.id;
       if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
-        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: profileError(profileRejection) })}\n`);
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...missingCliResponse(request.method) })}\n`);
       }
       return;
     }
@@ -454,35 +284,12 @@ export const experimental_providerBridge = {
       });
       return;
     }
-    const forwarded = subagentTransformed.parsed as Record<string, any> | null;
-    const usesRoutedProfile = activeIdentities.get(forwarded?.params?.threadId)?.profileHash !== undefined;
-    const compactError = compaction.prepare(forwarded, usesRoutedProfile);
+    const compactError = compaction.prepare(subagentTransformed.parsed);
     if (compactError) {
       process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request?.id, error: { code: -32000, message: compactError } })}\n`);
       return;
     }
-    if ((forwarded?.method === "turn/start" || forwarded?.method === "turn/steer") &&
-        forwarded.jsonrpc === "2.0" && (typeof forwarded.id === "string" || typeof forwarded.id === "number") &&
-        typeof forwarded.params?.threadId === "string" && typeof forwarded.params?.clientRequestId === "string" && usesRoutedProfile) {
-      pendingInputs.set(forwarded.id, {
-        threadId: forwarded.params.threadId,
-        clientRequestId: forwarded.params.clientRequestId,
-        steer: forwarded.method === "turn/steer",
-      });
-    }
     const forwardedLine = mapPromptMode(subagentTransformed.line, subagentTransformed.parsed);
-    const threadId = forwarded?.params?.threadId;
-    if (forwarded?.method === "thread/stop" && typeof threadId === "string" &&
-        (typeof forwarded.id === "string" || typeof forwarded.id === "number") && hasPendingRoutedWork(threadId)) {
-      const closing: ClosingSession = { id: forwarded.id, line: forwardedLine, pastEarlyAck: false, phase: "first-stop" };
-      closingSessions.set(threadId, closing);
-      // In SDK 0.6.178, stop with no session replies inline. An already stopping session
-      // replies after one await. A stop that takes ownership awaits connection.kill first.
-      // Keep the early acknowledgement fenced until the original input/setup settles.
-      experimental_acpProviderBridge.handleLine(forwardedLine);
-      queueMicrotask(() => { closing.pastEarlyAck = true; });
-      return;
-    }
     experimental_acpProviderBridge.handleLine(forwardedLine);
   },
 };

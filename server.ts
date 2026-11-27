@@ -42,12 +42,6 @@ export default async function antigravity(bb: BbPluginApi) {
       description: "Display Antigravity tool summaries on command execution cards.",
       default: true,
     },
-    profileRoutingEnabled: {
-      type: "boolean",
-      label: "Enable Antigravity profile routing",
-      description: "Use Antigravity profile overrides for sessions. Turning this off pauses routed sessions.",
-      default: false,
-    },
   });
   const register = () => bb.providers.register({
     id: "antigravity-cli",
@@ -68,7 +62,6 @@ export default async function antigravity(bb: BbPluginApi) {
         autoApprove: settings.autoApprove === true,
         providerSubagentsEnabled: settings.subagentsDisabled !== true,
         commandDescriptionsEnabled: settings.commandDescriptionsEnabled !== false,
-        profileRoutingEnabled: settings.profileRoutingEnabled === true,
         acpDialect: ANTIGRAVITY_ACP_DIALECT_ID,
         acpLaunchSpec: {
           ...launchSpec,

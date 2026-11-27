@@ -1044,25 +1044,3 @@ test('older listResources does not overwrite newer knownResources label', async 
   const disconnectedList = await listResources({});
   assert.equal(disconnectedList.resources[0].label, 'New Label');
 });
-
-test('host-scoped usage preserves the host home despite profile override env vars', async () => {
-  const hostEnv = {
-    HOME: 'synthetic-host-home',
-    USERPROFILE: 'synthetic-host-home',
-    BB_ANTIGRAVITY_GEMINI_DIR: 'synthetic-profile',
-    BB_ANTIGRAVITY_APP_DATA_DIR: 'work-app',
-  };
-  let invocation;
-  await readAntigravityProviderUsage({
-    env: hostEnv,
-    resolveCommand: (_command, options) => {
-      assert.equal(options.env, hostEnv);
-      return process.execPath;
-    },
-    execFile: async (_command, args, options) => {
-      invocation = { args, env: options.env };
-      return { stdout: SAMPLE_USAGE_JSON, stderr: '' };
-    },
-  });
-  assert.deepEqual(invocation, { args: ['-p', '/usage', '--output-format', 'json'], env: hostEnv });
-});

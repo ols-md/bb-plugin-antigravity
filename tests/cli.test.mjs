@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, parse, resolve } from 'node:path';
+import { join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { providerHealthResultSchema, providerInstallationStatusSchema } from '@get-bb/plugin-sdk/provider-bridge';
-import { prepareAntigravityProfile, resolveAntigravityCommand, resolveAntigravityLaunchSpec } from '../cli.ts';
+import { resolveAntigravityCommand, resolveAntigravityLaunchSpec } from '../cli.ts';
 import { readAntigravityProviderUsage } from '../usage.ts';
 
 function callBridge(requests, { defaultTaskState = false, ...options } = {}) {
@@ -267,60 +267,7 @@ test('provider health uses one version probe and explains when agy is too old', 
   }
 });
 
-test('profile flags use the configured directory and preserve a trusted CLI flag', () => {
-  const profile = resolve('synthetic-profile', '.gemini');
-  const spec = { args: ['acp', '--gemini-dir', profile, '--disable-telemetry'], env: {} };
-  const options = {
-    providerOptions: { profileRoutingEnabled: true, acpLaunchSpec: spec },
-    envVars: { BB_ANTIGRAVITY_GEMINI_DIR: 'ignored', BB_ANTIGRAVITY_APP_DATA_DIR: 'work-app' },
-  };
-  assert.ok(prepareAntigravityProfile(options));
-  assert.deepEqual(spec.args, ['acp', '--gemini-dir', profile, '--disable-telemetry', '--app-data-dir', 'work-app']);
-});
-
-test('empty session overrides neutralize profile env inherited from the host', () => {
-  const spec = { args: ['acp'], env: { BB_ANTIGRAVITY_GEMINI_DIR: resolve('synthetic-profile') } };
-  assert.equal(prepareAntigravityProfile({
-    providerOptions: { profileRoutingEnabled: true, acpLaunchSpec: spec },
-    envVars: { BB_ANTIGRAVITY_GEMINI_DIR: '' },
-  }), undefined);
-  assert.deepEqual(spec.args, ['acp']);
-});
-
-test('profile routing requires an unambiguous app-data directory name', () => {
-  for (const appData of ['../other', 'nested/app', resolve('synthetic-profile')]) {
-    assert.equal(prepareAntigravityProfile({
-      providerOptions: { profileRoutingEnabled: true, acpLaunchSpec: { args: ['acp'], env: {} } },
-      envVars: { BB_ANTIGRAVITY_GEMINI_DIR: resolve('synthetic-profile'), BB_ANTIGRAVITY_APP_DATA_DIR: appData },
-    }), null);
-  }
-});
-
-test('profile routing pins a Gemini directory alias and rejects linked app-data directories', t => {
-  const root = mkdtempSync(join(tmpdir(), 'agy-profile-links-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const target = join(root, 'profile');
-  const alias = join(root, 'alias');
-  const appTarget = join(root, 'app-data');
-  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-  mkdirSync(target);
-  mkdirSync(appTarget);
-  symlinkSync(target, alias, linkType);
-  const options = () => ({
-    providerOptions: { profileRoutingEnabled: true, acpLaunchSpec: { args: ['acp'], env: {} } },
-    envVars: { BB_ANTIGRAVITY_GEMINI_DIR: alias, BB_ANTIGRAVITY_APP_DATA_DIR: 'work-app' },
-  });
-  const initiallyMissing = options();
-  assert.ok(prepareAntigravityProfile(initiallyMissing));
-  assert.deepEqual(initiallyMissing.providerOptions.acpLaunchSpec.args, ['acp', '--gemini-dir', target, '--app-data-dir', 'work-app']);
-
-  symlinkSync(appTarget, join(target, 'work-app'), linkType);
-  assert.equal(prepareAntigravityProfile(options()), null);
-  rmdirSync(appTarget);
-  assert.equal(prepareAntigravityProfile(options()), null);
-});
-
-test('executable discovery uses the host PATH while profile flags use session overrides', t => {
+test('executable discovery uses the host PATH despite session overrides', t => {
   const root = mkdtempSync(join(tmpdir(), 'agy-host-env-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const hostBin = join(root, 'host-bin');
@@ -329,14 +276,34 @@ test('executable discovery uses the host PATH while profile flags use session ov
   const hostExecutable = join(hostBin, executable);
   writeDecoy(hostExecutable);
   writeDecoy(join(sessionBin, executable));
-  const geminiDir = join(root, 'synthetic-profile', '.gemini');
   const spec = { command: 'agy', args: ['acp'], env: { PATH: hostBin } };
   const options = {
-    providerOptions: { profileRoutingEnabled: true, acpLaunchSpec: spec },
-    envVars: { PATH: sessionBin, LOCALAPPDATA: sessionBin, BB_ANTIGRAVITY_GEMINI_DIR: geminiDir },
+    providerOptions: { acpLaunchSpec: spec },
+    envVars: { PATH: sessionBin, LOCALAPPDATA: sessionBin },
   };
   assert.equal(resolveAntigravityLaunchSpec({ params: { options } }), true);
   assert.equal(spec.command, hostExecutable);
-  assert.ok(prepareAntigravityProfile(options));
-  assert.deepEqual(spec.args, ['acp', '--gemini-dir', geminiDir]);
+});
+
+test('the host rejects legacy routed sessions before forwarding work to ACP', () => {
+  const params = { threadId: 'legacy-thread', providerThreadId: 'antigravity-profile:1:synthetic' };
+  const methods = ['thread/resume', 'turn/start', 'turn/steer'];
+  const responses = callBridge(methods.map(method => ({ method, params })));
+  for (const response of responses.values()) {
+    assert.equal(response.error?.message, 'Antigravity profile routing was removed. Start a new Antigravity thread.');
+  }
+});
+
+test('the host rejects profile flags in session launch arguments', () => {
+  const profileArgs = [['--gemini-dir', 'synthetic'], ['--app_data_dir=synthetic']];
+  const responses = callBridge(profileArgs.map(args => ({
+    method: 'thread/start',
+    params: {
+      threadId: 'new-thread',
+      options: { providerOptions: { acpLaunchSpec: { command: process.execPath, args: ['acp', ...args] } } },
+    },
+  })));
+  for (const response of responses.values()) {
+    assert.equal(response.error?.message, 'Antigravity profile overrides are no longer supported.');
+  }
 });
