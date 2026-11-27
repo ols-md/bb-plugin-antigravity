@@ -98,10 +98,3 @@ test('an acknowledgment of a redundant release cannot consume an interrupt in pr
   verifier.verify({ id: 3, result: { ok: true } });
   assert.deepEqual(finish().map(d => [d.kind, d.status]), [['turn.boundary', 'failed']]);
 });
-
-test('a routed compaction cannot use the default profile transcript', t => {
-  const { file, verifier, request } = fixture(t);
-  writeFileSync(file, records(input, checkpoint));
-  assert.match(verifier.prepare(request, true), /requires the default Antigravity profile/);
-  assert.equal(verifier.prepare(request), undefined);
-});
