@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, openSync, closeSync, renameSync, rmdirSync, wri
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText, withTaskStateLock } from '../background-tasks.ts';
+import { MAX_TASK_STATE_BYTES, createBackgroundTaskTracker, normalizeFileUri, deriveTranscriptPathFromLogFile, extractToolOutputText, withTaskStateLock } from '../background-tasks.ts';
 
 const command = (id = 'conv/task-1', extra = {}) => ({ toolCallId: `call:${id}`, title: 'run_command', status: 'completed', content: [{ type: 'text', text: `Tool is running as a background task with task id: ${id}\nTask Description: build\n` }], ...extra });
 const agent = (id = 'agent-1') => ({ toolCallId: `call:${id}`, title: 'invoke_subagent', status: 'completed', rawInput: { Role: 'Research' }, rawOutput: { conversationId: id } });
@@ -248,6 +248,42 @@ test('stream completion buffers span chunks, remain isolated, and flush at text 
 });
 
 const statePath = t => { const dir = mkdtempSync(join(tmpdir(), 'background-state-')); t.after(() => rmSync(dir, { recursive: true, force: true })); return join(dir, 'background-tasks.json'); };
+
+test('oversized state survives startup and the next registration', t => {
+  const path = statePath(t);
+  const bytes = Buffer.alloc(MAX_TASK_STATE_BYTES + 1, 0x61);
+  writeFileSync(path, bytes);
+  const tr = tracker(t, { persistPath: path });
+  assert.deepEqual(readFileSync(path), bytes);
+  tr.handleToolEventForThread('thread', command());
+  assert.deepEqual(readFileSync(path), bytes);
+});
+
+test('an oversized write preserves the last recoverable state', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path });
+  tr.handleToolEventForThread('thread', command());
+  const previous = readFileSync(path);
+  tr.handleToolEventForThread('\u00e9'.repeat(MAX_TASK_STATE_BYTES / 2), command());
+  assert.ok(readFileSync(path).equals(previous));
+  tr.clearThread('thread');
+  const restarted = tracker(t, { persistPath: path });
+  assert.deepEqual(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: 'thread' } }), []);
+});
+
+test('a deferred registration survives restart once another task releases space', t => {
+  const path = statePath(t);
+  const tr = tracker(t, { persistPath: path });
+  const padding = 'x'.repeat(MAX_TASK_STATE_BYTES / 2);
+  const first = 'a' + padding;
+  const second = 'b' + padding;
+  tr.handleToolEventForThread(first, command());
+  tr.handleToolEventForThread(second, command());
+  assert.equal(JSON.parse(readFileSync(path)).tasks.length, 1);
+  tr.clearThread(first);
+  const restarted = tracker(t, { persistPath: path });
+  assert.equal(restarted.handleInboundRequest({ method: 'thread/resume', params: { threadId: second } }).length, 1);
+});
 
 test('registration persists a versioned record and settling removes it', t => {
   const path = statePath(t);
@@ -779,13 +815,13 @@ test('transient startup reads retry and populate restart inventory and stale-rec
   let readFailures = ['EBUSY', 'EPERM'];
   let readAttempts = 0;
   const taskStateFs = {
-    readFileSync(filePath, options) {
+    openSync(filePath, options) {
       if (filePath === path) {
         readAttempts += 1;
         const code = readFailures.shift();
         if (code) throw fsError(code);
       }
-      return readFileSync(filePath, options);
+      return openSync(filePath, options);
     },
   };
 
@@ -829,9 +865,9 @@ test('resume during transient read reconciles safely and emits closes while pres
     persistPath: pathA,
     onAsyncDeltas: (threadId, deltas) => emittedA.push({ threadId, deltas }),
     taskStateFs: {
-      readFileSync(filePath, options) {
+      openSync(filePath, options) {
         if (blockReadA && filePath === pathA) throw fsError('EPERM');
-        return readFileSync(filePath, options);
+        return openSync(filePath, options);
       },
     },
   });
@@ -881,9 +917,9 @@ test('resume during transient read reconciles safely and emits closes while pres
     persistPath: pathB,
     onAsyncDeltas: (threadId, deltas) => emittedB.push({ threadId, deltas }),
     taskStateFs: {
-      readFileSync(filePath, options) {
+      openSync(filePath, options) {
         if (blockReadB && filePath === pathB) throw fsError('EBUSY');
-        return readFileSync(filePath, options);
+        return openSync(filePath, options);
       },
     },
   });
@@ -1124,10 +1160,10 @@ test('dispose guards persisted state against late calls and cancels pending pers
     persistPath: path,
     onAsyncDeltas: (threadId, deltas) => asyncEvents.push({ threadId, deltas }),
     taskStateFs: {
-      readFileSync(filePath, options) {
+      openSync(filePath, options) {
         if (disposedFlag) readsAfterDispose += 1;
         if (blockRead && filePath === path) throw fsError('EBUSY');
-        return readFileSync(filePath, options);
+        return openSync(filePath, options);
       },
     },
   });

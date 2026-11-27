@@ -1,4 +1,4 @@
-import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { openSync, closeSync, fstatSync, readSync, statSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -360,7 +360,8 @@ export interface TaskStateFs {
   openSync: typeof openSync;
   closeSync: typeof closeSync;
   statSync: typeof statSync;
-  readFileSync: typeof readFileSync;
+  fstatSync: typeof fstatSync;
+  readSync: typeof readSync;
   readdirSync: typeof readdirSync;
   writeFileSync: typeof writeFileSync;
   renameSync: typeof renameSync;
@@ -369,7 +370,7 @@ export interface TaskStateFs {
 }
 
 const DEFAULT_TASK_STATE_FS: TaskStateFs = {
-  openSync, closeSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync,
+  openSync, closeSync, statSync, fstatSync, readSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync,
 };
 
 function isTransientFsError(error: unknown): boolean {
@@ -466,6 +467,8 @@ export function withTaskStateLock<T>(
   }
 }
 
+export const MAX_TASK_STATE_BYTES = 1024 * 1024;
+
 interface LoadedTaskState {
   tasks: PersistedBackgroundTask[];
   needsWrite: boolean;
@@ -477,7 +480,24 @@ function loadTaskState(path: string, maxAgeMs: number, fsOps: TaskStateFs = DEFA
   if (!path) return { tasks: [], needsWrite: false, ioError: 'none' };
   let raw: string;
   try {
-    raw = fsOps.readFileSync(path, 'utf8');
+    const fd = fsOps.openSync(path, 'r');
+    try {
+      const { size } = fsOps.fstatSync(fd);
+      const unreadable: LoadedTaskState = { tasks: [], needsWrite: false, ioError: 'fatal' };
+      if (size > MAX_TASK_STATE_BYTES) return unreadable;
+      // Probe one extra byte so growth during the read cannot turn a prefix into valid state.
+      const bytes = Buffer.allocUnsafe(size + 1);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = fsOps.readSync(fd, bytes, offset, bytes.length - offset, offset);
+        if (!count) break;
+        offset += count;
+      }
+      if (offset !== size) return unreadable;
+      raw = bytes.toString('utf8', 0, offset);
+    } finally {
+      fsOps.closeSync(fd);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { tasks: [], needsWrite: false, ioError: 'none' };
     return { tasks: [], needsWrite: false, ioError: isTransientFsError(error) && !isDirectoryPath(path, fsOps) ? 'transient' : 'fatal' };
@@ -514,9 +534,11 @@ function loadTaskState(path: string, maxAgeMs: number, fsOps: TaskStateFs = DEFA
 function writeTaskState(path: string, tasks: PersistedBackgroundTask[], fsOps: TaskStateFs = DEFAULT_TASK_STATE_FS): 'saved' | 'transient' | 'failed' {
   let temp: string | undefined;
   try {
+    const raw = `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`;
+    if (Buffer.byteLength(raw) > MAX_TASK_STATE_BYTES) return 'failed';
     fsOps.mkdirSync(dirname(path), { recursive: true });
     temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    fsOps.writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
+    fsOps.writeFileSync(temp, raw);
     fsOps.renameSync(temp, path);
     temp = undefined;
     return 'saved';
@@ -739,14 +761,16 @@ export function createBackgroundTaskTracker(options: {
     localTouchedBeforeStartupLoad.clear();
     clearedBeforeStartupLoad.clear();
   }
-  function applyPendingWrites(loadedTasks: PersistedBackgroundTask[]): PersistedBackgroundTask[] {
+  function savePendingWrites(path: string, loadedTasks: PersistedBackgroundTask[]) {
     const persisted = new Map(loadedTasks.map(record => [recordKey(record), record]));
     const records = new Map(persisted);
     for (const change of pendingWrites.values()) {
       const key = recordKey(change.record);
       const existing = records.get(key);
       if (change.remove) {
-        if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
+        if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) {
+          records.delete(key);
+        }
         continue;
       }
       const onDisk = persisted.get(key);
@@ -761,7 +785,30 @@ export function createBackgroundTaskTracker(options: {
         records.set(key, change.record);
       }
     }
-    return [...records.values()];
+    // Apply removals first in the byte budget and give surviving disk records priority.
+    const retained = [...records.values()].filter(record => persisted.get(recordKey(record)) === record);
+    const deferred = new Set<PersistedBackgroundTask>();
+    const emptyBytes = Buffer.byteLength('{"version":1,"tasks":[]}\n');
+    let used = Buffer.byteLength(JSON.stringify({ version: 1, tasks: retained }) + '\n');
+    for (const [key, record] of records) {
+      if (persisted.get(key) === record) continue;
+      const bytes = Buffer.byteLength(JSON.stringify(record));
+      const additionalBytes = bytes + Number(retained.length > 0);
+      if (used + additionalBytes > MAX_TASK_STATE_BYTES) {
+        if (emptyBytes + bytes <= MAX_TASK_STATE_BYTES) deferred.add(record);
+        continue;
+      }
+      retained.push(record);
+      used += additionalBytes;
+    }
+    const result = writeTaskState(path, retained, fsOps);
+    if (result === 'saved') {
+      for (const [key, change] of pendingWrites) {
+        if (deferred.has(change.record)) change.delayed = true;
+        else pendingWrites.delete(key);
+      }
+    }
+    return result;
   }
   function flushPendingWrites() {
     if (disposed || !persistPath || !hasPendingPersistenceWork()) { clearPersistRetry(); return; }
@@ -785,9 +832,8 @@ export function createBackgroundTaskTracker(options: {
         }
       }
       if (pendingWrites.size) {
-        const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks), fsOps);
+        const result = savePendingWrites(persistPath, loaded.tasks);
         if (result !== 'saved') return result;
-        pendingWrites.clear();
         startupGcPending = false;
         return 'saved' as const;
       }
@@ -862,9 +908,8 @@ export function createBackgroundTaskTracker(options: {
       pendingReconciliations.delete(thread);
       if (pending.length) queuePendingWrites(thread, pending, true);
       if (pendingWrites.size) {
-        const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks), fsOps);
+        const result = savePendingWrites(persistPath, loaded.tasks);
         if (result === 'saved') {
-          pendingWrites.clear();
           startupGcPending = false;
           return { outcome: 'saved' as const, readSucceeded: true };
         }
