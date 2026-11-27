@@ -1,6 +1,7 @@
-import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { createConnection, createServer } from 'node:net';
+import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, symlinkSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { hostHomeDirectory } from './cli.ts';
 import { inferAntigravityToolName } from './dialect.ts';
@@ -351,7 +352,42 @@ export function defaultBackgroundTaskStatePath(): string | undefined {
   return home === undefined ? undefined : join(home, '.bb', 'plugin-data', 'bb-plugin-antigravity', 'background-tasks.json');
 }
 
-const LOCK_MARKER_PATTERN = /^(\d+)-[0-9a-f-]+\.lock$/i;
+const LOCK_MARKER_PATTERN = /^(\d+)-(?:(ab)-)?([0-9a-f-]+)\.lock$/i;
+
+// An ordinary UUID starts with eight hex digits, so "ab-" distinguishes new markers
+// while remaining inside the character set recognized by older writers.
+function lockEndpoint(lockDir: string, token: string) {
+  if (process.platform === 'win32') return { path: `\\\\.\\pipe\\bb-antigravity-${token}` };
+  const name = `${token}.sock`;
+  const path = join(lockDir, name);
+  if (Buffer.byteLength(path) < 100) return { path };
+  // Unix socket addresses are length-limited. Each caller can reach the shared
+  // directory through its own short alias, even from a private /tmp mount.
+  const alias = join('/tmp', randomUUID());
+  symlinkSync(resolve(lockDir), alias);
+  return { path: join(alias, name), alias };
+}
+
+const pendingProbes = new Set<string>();
+
+function probeLockOwner(lockDir: string, marker: string, token: string, fsOps: TaskStateFs): void {
+  if (pendingProbes.has(marker)) return;
+  const endpoint = lockEndpoint(lockDir, token);
+  const socket = createConnection(endpoint.path);
+  pendingProbes.add(marker);
+  socket.once('connect', () => socket.destroy());
+  socket.once('error', (error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT' && error.code !== 'ECONNREFUSED') return;
+    unlinkUniqueMarker(marker, fsOps);
+    if (process.platform !== 'win32') unlinkUniqueMarker(join(lockDir, `${token}.sock`), fsOps);
+  });
+  socket.once('close', () => {
+    pendingProbes.delete(marker);
+    if (endpoint.alias) unlinkUniqueMarker(endpoint.alias);
+  });
+  socket.unref();
+}
+
 const LOCK_RETRY_BASE_MS = 10;
 const LOCK_RETRY_MAX_MS = 500;
 const TRANSIENT_IO_MAX_RETRIES = 20;
@@ -415,8 +451,8 @@ function unlinkUniqueMarker(markerPath: string, fsOps: TaskStateFs = DEFAULT_TAS
 
 /**
  * Non-blocking cross-process lock around `background-tasks.json` using unique per-attempt
- * markers in `<path>.locks/`. Each attempt creates `<pid>-<uuid>.lock` with `wx`, enumerates
- * all markers before the critical section, prunes only definitively dead PIDs (`ESRCH`), and
+ * markers in `<path>.locks/`. Each attempt binds a unique local socket, publishes its marker with `wx`, and enumerates
+ * all markers before the critical section. It prunes dead PIDs, probes other socket owners, and
  * yields (removing only its own unique marker) if any other live contender exists. Live writers
  * are never evicted by age, and unique marker names prevent shared-filename unlink races.
  */
@@ -428,41 +464,47 @@ export function withTaskStateLock<T>(
   if (!path) return { status: 'error' };
   const fsOps: TaskStateFs = fsOverrides ? { ...DEFAULT_TASK_STATE_FS, ...fsOverrides } : DEFAULT_TASK_STATE_FS;
   const lockDir = `${path}.locks`;
-  const markerName = `${process.pid}-${randomUUID()}.lock`;
+  const token = randomUUID();
+  const markerName = `${process.pid}-ab-${token}.lock`;
+  const owner = createServer(socket => socket.destroy());
+  owner.on('error', () => {});
   const markerPath = join(lockDir, markerName);
   let markerCreated = false;
+  let boundThroughAlias = false;
   try {
-    fsOps.mkdirSync(lockDir, { recursive: true });
-    const fd = fsOps.openSync(markerPath, 'wx');
-    markerCreated = true;
-    fsOps.closeSync(fd);
-  } catch (error) {
-    if (markerCreated) unlinkUniqueMarker(markerPath, fsOps);
-    return isTransientFsError(error) ? { status: 'transient' } : { status: 'error' };
-  }
-  let entries: string[];
-  try {
-    entries = fsOps.readdirSync(lockDir);
-  } catch (error) {
-    unlinkUniqueMarker(markerPath, fsOps);
-    return isTransientFsError(error) ? { status: 'transient' } : { status: 'error' };
-  }
-  for (const entry of entries) {
-    if (entry === markerName) continue;
-    const match = LOCK_MARKER_PATTERN.exec(entry);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    if (isPidDefinitivelyDead(pid)) {
-      unlinkUniqueMarker(join(lockDir, entry), fsOps);
-      continue;
+    try {
+      fsOps.mkdirSync(lockDir, { recursive: true });
+      const endpoint = lockEndpoint(lockDir, token);
+      try {
+        owner.listen(endpoint.path).unref();
+        if (!owner.listening) return { status: 'transient' };
+        boundThroughAlias = !!endpoint.alias;
+      } finally {
+        if (endpoint.alias) unlinkUniqueMarker(endpoint.alias);
+      }
+      const fd = fsOps.openSync(markerPath, 'wx');
+      markerCreated = true;
+      fsOps.closeSync(fd);
+      for (const entry of fsOps.readdirSync(lockDir)) {
+        if (entry === markerName) continue;
+        const match = LOCK_MARKER_PATTERN.exec(entry);
+        if (!match) continue;
+        if (match[2]) {
+          probeLockOwner(lockDir, join(lockDir, entry), match[3], fsOps);
+        } else if (isPidDefinitivelyDead(Number(match[1]))) {
+          unlinkUniqueMarker(join(lockDir, entry), fsOps);
+          continue;
+        }
+        return { status: 'contended' };
+      }
+    } catch (error) {
+      return isTransientFsError(error) ? { status: 'transient' } : { status: 'error' };
     }
-    unlinkUniqueMarker(markerPath, fsOps);
-    return { status: 'contended' };
-  }
-  try {
     return { status: 'acquired', value: fn() };
   } finally {
-    unlinkUniqueMarker(markerPath, fsOps);
+    owner.close();
+    if (boundThroughAlias) unlinkUniqueMarker(join(lockDir, `${token}.sock`));
+    if (markerCreated) unlinkUniqueMarker(markerPath, fsOps);
   }
 }
 
