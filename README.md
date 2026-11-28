@@ -2,7 +2,7 @@
   <img src="assets/icon.svg" width="72" height="72" alt="Antigravity plugin icon">
 </p>
 
-<h1 align="center">Antigravity CLI Provider for BB</h1>
+<h1 align="center">Antigravity Provider for BB</h1>
 
 [![Latest GitHub release](https://img.shields.io/github/v/release/ols-md/bb-plugin-antigravity?logo=github)](https://github.com/ols-md/bb-plugin-antigravity/releases/latest)
 [![Public repository checks on main](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/ols-md/bb-plugin-antigravity/actions/workflows/checks.yml)
@@ -52,7 +52,7 @@ BB uses the Antigravity login on the agent host for sessions and usage reporting
 
 ### 2. Install the plugin
 
-In BB, open **Plugins** from the navigation rail. In the Community marketplace, find **Antigravity CLI Provider [Experimental]** and select **Install**. You can also install it from the command line.
+In BB, open **Plugins** from the navigation rail. In the Community marketplace, find **Antigravity Provider [Experimental]** and select **Install**. You can also install it from the command line.
 
 ```sh
 bb plugin install antigravity-cli
@@ -113,7 +113,7 @@ Plan is agent behavior, not enforced read-only access. Permission approvals and 
 
 ## Settings
 
-Open **Settings -> Installed plugins -> Antigravity CLI Provider [Experimental]** and use **Show in provider picker** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
+Open **Settings -> Installed plugins -> Antigravity Provider [Experimental]** and use **Show in provider picker** to show or hide the provider. Changes apply immediately. Hiding the provider does not stop a running turn. BB's standard installed-plugin switch disables the entire plugin.
 
 The **Request CLI terminal sandbox** setting adds `--sandbox` for new threads. Off means inherit CLI settings, not force sandboxing off. Availability depends on the host OS.
 
